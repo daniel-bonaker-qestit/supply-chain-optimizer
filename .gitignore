@@ -36,3 +36,43 @@ venv/
 # Logs / scratch
 *.log
 .scratch/
+
+# Skills CLI: regenerate per-agent dirs from skills-lock.json on demand.
+# Keep .claude/ and .agents/ (canonical) tracked; ignore the rest.
+.adal/
+.aider-desk/
+.augment/
+.bob/
+.codeartsdoer/
+.codebuddy/
+.codemaker/
+.codestudio/
+.commandcode/
+.continue/
+.cortex/
+.crush/
+.devin/
+.factory/
+.forge/
+.goose/
+.iflow/
+.junie/
+.kilocode/
+.kiro/
+.kode/
+.mcpjam/
+.mux/
+.neovate/
+.openhands/
+.pi/
+.pochi/
+.qoder/
+.qwen/
+.roo/
+.rovodev/
+.tabnine/
+.trae/
+.vibe/
+.windsurf/
+.zencoder/
+
