@@ -70,13 +70,26 @@ function foodChain(): Chain {
 }
 
 function foodCommittedContracts(): Contract[] {
+  const SHELF_LIFE = 96;
+  const SHELF_THRESHOLD = 24;
+  const trialFor = (mainDue: number, totalQty: number) => {
+    const dueByHour = Math.max(24, mainDue - 36);
+    const quantity = Math.max(1, Math.round(totalQty * 0.1));
+    return {
+      quantity,
+      dueByHour,
+      initialShelfLife: SHELF_LIFE,
+      minShelfLifeAtDelivery: SHELF_THRESHOLD,
+    };
+  };
+
   return [
-    { id: 'food-c1', endpoint: 'retailer', quantity: 200, dueByHour: 48,  revenue: 10.0, kind: 'committed' },
-    { id: 'food-c2', endpoint: 'retailer', quantity: 350, dueByHour: 72,  revenue: 11.0, kind: 'committed' },
-    { id: 'food-c3', endpoint: 'retailer', quantity: 250, dueByHour: 96,  revenue: 12.0, kind: 'committed' },
-    { id: 'food-c4', endpoint: 'retailer', quantity: 400, dueByHour: 120, revenue: 11.5, kind: 'committed' },
-    { id: 'food-c5', endpoint: 'retailer', quantity: 150, dueByHour: 144, revenue: 10.5, kind: 'committed' },
-    { id: 'food-c6', endpoint: 'retailer', quantity: 100, dueByHour: 160, revenue: 10.0, kind: 'committed' },
+    { id: 'food-c1', endpoint: 'retailer', quantity: 200, dueByHour: 48,  revenue: 10.0, kind: 'committed', trial: trialFor(48, 200) },
+    { id: 'food-c2', endpoint: 'retailer', quantity: 350, dueByHour: 72,  revenue: 11.0, kind: 'committed', trial: trialFor(72, 350) },
+    { id: 'food-c3', endpoint: 'retailer', quantity: 250, dueByHour: 96,  revenue: 12.0, kind: 'committed', trial: trialFor(96, 250) },
+    { id: 'food-c4', endpoint: 'retailer', quantity: 400, dueByHour: 120, revenue: 11.5, kind: 'committed', trial: trialFor(120, 400) },
+    { id: 'food-c5', endpoint: 'retailer', quantity: 150, dueByHour: 144, revenue: 10.5, kind: 'committed', trial: trialFor(144, 150) },
+    { id: 'food-c6', endpoint: 'retailer', quantity: 100, dueByHour: 160, revenue: 10.0, kind: 'committed', trial: trialFor(160, 100) },
   ];
 }
 

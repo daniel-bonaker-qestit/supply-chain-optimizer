@@ -8,6 +8,11 @@ import type {
   Shipment,
 } from '../domain/types.ts';
 import {
+  expandContractsForOptimizer,
+  type SubContractRef,
+  TRIAL_SUFFIX,
+} from '../domain/contract-expansion.ts';
+import {
   generateEvents,
   isWeekendHour,
 } from '../events/event-generator.ts';
@@ -17,18 +22,28 @@ import type {
 } from '../events/types.ts';
 import type { Hazard } from '../hazards/types.ts';
 import { solve } from '../optimizer/optimizer.ts';
+import { shelfLifeCostOfLeg } from '../quality/food-shelf-life.ts';
 
 export type SimulationStatus = 'running' | 'complete';
 export type ContractStatus =
   | 'on-track'
   | 'pending'
   | 'delivered'
-  | 'breached';
+  | 'breached'
+  | 'trial-pending'
+  | 'main-active'
+  | 'voided';
 
 export interface ContractDeliveryStatus {
   contractId: ContractId;
   delivered: number;
+  trialDelivered: number;
+  mainDelivered: number;
   status: ContractStatus;
+  /** undefined = not yet evaluated; true = passed; false = failed. */
+  trialQualityPassed: boolean | undefined;
+  /** Minimum shelf-life observed across trial-allocated chunks (Infinity if none). */
+  trialMinShelfLife: number;
 }
 
 export interface EventLogEntry {
@@ -39,10 +54,12 @@ export interface EventLogEntry {
     | 'sim-start'
     | 'sim-complete'
     | 'hazard-injected'
-    | 'replan-suppressed';
+    | 'replan-suppressed'
+    | 'trial-evaluated';
   detail: string;
   eventId?: string;
   hazardId?: string;
+  contractId?: ContractId;
 }
 
 export interface SimulationState {
@@ -53,17 +70,11 @@ export interface SimulationState {
   inFlight: readonly Shipment[];
   contractDeliveries: Readonly<Record<ContractId, ContractDeliveryStatus>>;
   totalCost: number | undefined;
-  /** All events scheduled for this run (including those not yet fired). */
   scheduledEvents: readonly SimEvent[];
-  /** Active disruptions currently affecting the optimizer. */
   activeDisruptions: readonly ActiveDisruption[];
-  /** Chronological log of fired events and replan triggers. */
   eventLog: readonly EventLogEntry[];
-  /** Per-non-origin-node on-hand inventory. */
   inventory: Readonly<Record<NodeId, number>>;
-  /** Hazards injected into this run, in injection order. */
   injectedHazards: readonly Hazard[];
-  /** If a cyberattack is active, replans are suppressed until this hour. */
   replanSuppressedUntilHour: number | undefined;
 }
 
@@ -71,25 +82,29 @@ export interface SimulatorInput {
   chain: Chain;
   contracts: Contract[];
   horizonHours: number;
-  /** Seed for deterministic event-timeline generation. */
   seed?: string;
-  /** Override the default event timeline (for testing). */
   events?: readonly SimEvent[];
 }
 
 const DELIVERY_EPSILON = 1e-6;
 
+interface FifoEntry {
+  qty: number;
+  shelfLife: number;
+}
+
 export class Simulator {
   private currentHour = 0;
   private status: SimulationStatus = 'running';
   private inFlight: Shipment[] = [];
+  private subContractDeliveries: Record<ContractId, number> = {};
   private contractDeliveries: Record<ContractId, ContractDeliveryStatus>;
   private totalCost: number | undefined = undefined;
   private plannedByReleaseHour: Map<number, Plan['shipments']>;
-  private contractsById: Map<ContractId, Contract>;
   private contractsByEndpoint: Map<string, Contract[]>;
   private nonOriginNodes: Set<NodeId>;
   private inventory: Record<NodeId, number>;
+  private nodeFifoQueues: Record<NodeId, FifoEntry[]>;
   private shipmentCounter = 0;
 
   private scheduledEvents: SimEvent[];
@@ -100,17 +115,26 @@ export class Simulator {
   private injectedHazards: Hazard[] = [];
   private replanSuppressedUntilHour: number | undefined;
 
+  private originalContracts: Contract[];
+  /** Working copy of the expanded sub-contract list passed to the optimizer. */
+  private expandedContracts: Contract[];
+  private subRefs: Map<ContractId, SubContractRef>;
+
   private constructor(
     private readonly input: SimulatorInput,
     initialPlan: Plan,
     events: SimEvent[],
+    expanded: Contract[],
+    subRefs: Map<ContractId, SubContractRef>,
   ) {
     this.plan = initialPlan;
     this.scheduledEvents = events;
+    this.originalContracts = input.contracts;
+    this.expandedContracts = expanded.map((c) => ({ ...c }));
+    this.subRefs = subRefs;
 
-    this.contractsById = new Map(input.contracts.map((c) => [c.id, c]));
     this.contractsByEndpoint = new Map();
-    for (const c of input.contracts) {
+    for (const c of this.expandedContracts) {
       const list = this.contractsByEndpoint.get(c.endpoint) ?? [];
       list.push(c);
       this.contractsByEndpoint.set(c.endpoint, list);
@@ -125,23 +149,31 @@ export class Simulator {
         .map((n) => n.id),
     );
     this.inventory = {};
-    for (const id of this.nonOriginNodes) this.inventory[id] = 0;
+    this.nodeFifoQueues = {};
+    for (const id of this.nonOriginNodes) {
+      this.inventory[id] = 0;
+      this.nodeFifoQueues[id] = [];
+    }
+
+    for (const c of this.expandedContracts) {
+      this.subContractDeliveries[c.id] = 0;
+    }
 
     this.contractDeliveries = Object.fromEntries(
-      input.contracts.map((c) => [
+      this.originalContracts.map((c) => [
         c.id,
         {
           contractId: c.id,
           delivered: 0,
-          status: deriveStatus(
-            c,
-            0,
-            0,
-            initialPlan.breachByContract[c.id] ?? 0,
-          ),
+          trialDelivered: 0,
+          mainDelivered: 0,
+          status: c.trial ? ('trial-pending' as const) : ('on-track' as const),
+          trialQualityPassed: undefined,
+          trialMinShelfLife: Number.POSITIVE_INFINITY,
         },
       ]),
     );
+    this.refreshAllStatuses(); // adjust for initial plan breach forecasts.
 
     this.plannedByReleaseHour = new Map();
     this.indexPlan(initialPlan);
@@ -164,9 +196,13 @@ export class Simulator {
             horizonHours: input.horizonHours,
           });
 
+    const { expanded, subRefs } = expandContractsForOptimizer(
+      input.contracts,
+    );
+
     const plan = await solve({
       chain: input.chain,
-      contracts: input.contracts,
+      contracts: expanded,
       currentHour: 0,
       horizonHours: input.horizonHours,
       inFlight: [],
@@ -174,7 +210,7 @@ export class Simulator {
       currentInventory: {},
       activeDisruptions: [],
     });
-    return new Simulator(input, plan, events);
+    return new Simulator(input, plan, events, expanded, subRefs);
   }
 
   async step(h: number): Promise<void> {
@@ -193,7 +229,6 @@ export class Simulator {
     this.processArrivals(h);
     this.processReleases(h);
 
-    // Fire events scheduled for this hour (only on active weekdays).
     const eventsAtH = this.scheduledEvents.filter(
       (e) => e.fireHour === h && !this.firedEventIds.has(e.id),
     );
@@ -214,6 +249,11 @@ export class Simulator {
 
     this.currentHour = h + 1;
 
+    // Evaluate trial-deadline transitions after arrivals at hour h
+    // (since arrivals at hour h count against trial deadlines).
+    const trialReplanNeeded = this.evaluateTrialDeadlines();
+    if (trialReplanNeeded) needsReplan = true;
+
     if (needsReplan && this.currentHour < this.input.horizonHours) {
       if (this.isReplanSuppressed(this.currentHour)) {
         this.eventLog.push({
@@ -231,7 +271,7 @@ export class Simulator {
 
     if (this.currentHour >= this.input.horizonHours) {
       this.status = 'complete';
-      this.totalCost = this.computeRealizedCost();
+      this.totalCost = this.plan.totalCost;
       this.eventLog.push({
         hour: this.currentHour,
         kind: 'sim-complete',
@@ -243,11 +283,11 @@ export class Simulator {
   private async replan(): Promise<void> {
     const newPlan = await solve({
       chain: this.input.chain,
-      contracts: this.input.contracts,
+      contracts: this.expandedContracts,
       currentHour: this.currentHour,
       horizonHours: this.input.horizonHours,
       inFlight: this.inFlight.slice(),
-      delivered: this.snapshotDelivered(),
+      delivered: { ...this.subContractDeliveries },
       currentInventory: { ...this.inventory },
       activeDisruptions: this.activeDisruptions.slice(),
     });
@@ -292,7 +332,6 @@ export class Simulator {
     });
 
     if (hazard.blocksReplans) {
-      // A new cyberattack extends or sets the suppression window.
       const until = hazard.injectedAtHour + hazard.durationHours;
       this.replanSuppressedUntilHour = Math.max(
         this.replanSuppressedUntilHour ?? 0,
@@ -322,78 +361,6 @@ export class Simulator {
     );
   }
 
-  private applyHazard(h: Hazard): void {
-    const fromHour = h.injectedAtHour;
-    const toHour = h.persistThroughHorizon
-      ? this.input.horizonHours
-      : h.injectedAtHour + h.durationHours;
-    const baseId = `disr-${h.id}`;
-    let n = 0;
-    const push = (
-      d: Omit<ActiveDisruption, 'id' | 'source' | 'sourceId' | 'fromHour' | 'toHour'>,
-    ) => {
-      this.activeDisruptions.push({
-        id: `${baseId}-${n++}`,
-        source: 'hazard',
-        sourceId: h.id,
-        fromHour,
-        toHour,
-        ...d,
-      });
-    };
-    switch (h.type) {
-      case 'strike':
-      case 'catastrophic-node-loss':
-      case 'weather-event':
-        if (h.targetNodeId) {
-          push({
-            nodeId: h.targetNodeId,
-            effectKind:
-              (h.capacityFactor ?? 0) === 0
-                ? 'block'
-                : 'capacity-factor',
-            capacityFactor: h.capacityFactor,
-          });
-        }
-        break;
-      case 'border-closure':
-      case 'sanctions':
-        for (const lid of h.targetLaneIds ?? []) {
-          push({
-            laneId: lid,
-            effectKind:
-              (h.capacityFactor ?? 0) === 0
-                ? 'block'
-                : 'capacity-factor',
-            capacityFactor: h.capacityFactor,
-          });
-        }
-        break;
-      case 'pandemic':
-        push({
-          effectKind: 'capacity-factor',
-          capacityFactor: h.capacityFactor,
-        });
-        break;
-      case 'equipment-recall':
-        if (h.blockMode) {
-          push({
-            mode: h.blockMode,
-            effectKind: 'block',
-          });
-        }
-        break;
-      case 'cyberattack':
-        // No state-disruption — only a replan-suppression window. We still
-        // record the disruption with a no-op effect so the UI can surface it.
-        push({
-          effectKind: 'capacity-factor',
-          capacityFactor: 1,
-        });
-        break;
-    }
-  }
-
   private indexPlan(plan: Plan): void {
     this.plannedByReleaseHour = new Map();
     for (const s of plan.shipments) {
@@ -404,52 +371,64 @@ export class Simulator {
   }
 
   private processArrivals(h: number): void {
+    const arriving: Shipment[] = [];
     const remaining: Shipment[] = [];
-    const arrivalsByEndpoint = new Map<string, number>();
-
     for (const s of this.inFlight) {
-      if (s.arrivesAtHour !== h) {
-        remaining.push(s);
-        continue;
-      }
-      const lane = this.input.chain.lanes.find((l) => l.id === s.laneId);
-      if (!lane) continue;
-      const node = lane.to;
-      // Increment node inventory (intermediate or endpoint).
-      if (this.nonOriginNodes.has(node)) {
-        this.inventory[node] = (this.inventory[node] ?? 0) + s.quantity;
-      }
-      if (this.contractsByEndpoint.has(node)) {
-        arrivalsByEndpoint.set(
-          node,
-          (arrivalsByEndpoint.get(node) ?? 0) + s.quantity,
-        );
-      }
+      if (s.arrivesAtHour === h) arriving.push(s);
+      else remaining.push(s);
     }
     this.inFlight = remaining;
 
-    for (const [endpoint, qty] of arrivalsByEndpoint) {
-      this.allocateArrivalsToContracts(endpoint, qty, h);
+    for (const s of arriving) {
+      const lane = this.input.chain.lanes.find((l) => l.id === s.laneId);
+      if (!lane) continue;
+      const node = lane.to;
+      const transit = lane.modes[s.mode].transitHours;
+      const arrivedShelfLife = Math.max(
+        0,
+        (s.shelfLifeAtRelease ?? 0) - shelfLifeCostOfLeg(s.mode, transit),
+      );
+      const isEndpoint = this.contractsByEndpoint.has(node);
+
+      if (this.nonOriginNodes.has(node)) {
+        this.inventory[node] = (this.inventory[node] ?? 0) + s.quantity;
+      }
+
+      if (isEndpoint) {
+        this.allocateEndpointArrival(node, s.quantity, arrivedShelfLife, h);
+      } else if (this.nonOriginNodes.has(node)) {
+        this.enqueueAtNode(node, s.quantity, arrivedShelfLife);
+      }
     }
   }
 
-  private allocateArrivalsToContracts(
-    endpoint: string,
+  private allocateEndpointArrival(
+    endpoint: NodeId,
     units: number,
+    shelfLife: number,
     arrivalHour: number,
   ): void {
     let remaining = units;
-    const contracts = this.contractsByEndpoint.get(endpoint) ?? [];
-    for (const c of contracts) {
+    const subList = this.contractsByEndpoint.get(endpoint) ?? [];
+    for (const sub of subList) {
       if (remaining <= DELIVERY_EPSILON) break;
-      // Skip past-deadline contracts.
-      if (c.dueByHour <= arrivalHour) continue;
-      const status = this.contractDeliveries[c.id]!;
-      const need = c.quantity - status.delivered;
+      if (sub.quantity <= DELIVERY_EPSILON) continue;
+      // Skip past-deadline sub-contracts.
+      if (sub.dueByHour <= arrivalHour) continue;
+      const delivered = this.subContractDeliveries[sub.id] ?? 0;
+      const need = sub.quantity - delivered;
       if (need <= DELIVERY_EPSILON) continue;
       const give = Math.min(need, remaining);
-      status.delivered += give;
+      this.subContractDeliveries[sub.id] = delivered + give;
       remaining -= give;
+
+      const ref = this.subRefs.get(sub.id);
+      if (ref?.phase === 'trial') {
+        const cd = this.contractDeliveries[ref.originalId];
+        if (cd && shelfLife < cd.trialMinShelfLife) {
+          cd.trialMinShelfLife = shelfLife;
+        }
+      }
     }
   }
 
@@ -464,11 +443,15 @@ export class Simulator {
         );
       }
       const transit = lane.modes[sc.mode].transitHours;
-      // Decrement origin inventory (only for non-origin nodes; origin is unbounded source).
-      if (this.nonOriginNodes.has(lane.from)) {
+      let shelfLifeAtRelease: number;
+      if (this.input.chain.origins.includes(lane.from)) {
+        shelfLifeAtRelease = INITIAL_SHELF_LIFE;
+      } else {
+        shelfLifeAtRelease = this.popFromNodeQueue(lane.from, sc.quantity);
         this.inventory[lane.from] =
           (this.inventory[lane.from] ?? 0) - sc.quantity;
       }
+
       this.inFlight.push({
         id: `ship-${this.shipmentCounter++}`,
         laneId: sc.laneId,
@@ -477,28 +460,83 @@ export class Simulator {
         releasedAtHour: sc.releaseHour,
         arrivesAtHour: sc.releaseHour + transit,
         contractId: sc.contractId,
+        shelfLifeAtRelease,
       });
     }
   }
 
-  private refreshAllStatuses(): void {
-    for (const c of this.input.contracts) {
-      const cd = this.contractDeliveries[c.id]!;
-      cd.status = deriveStatus(
-        c,
-        this.currentHour,
-        cd.delivered,
-        this.plan.breachByContract[c.id] ?? 0,
-      );
-    }
+  private enqueueAtNode(node: NodeId, qty: number, shelfLife: number): void {
+    const queue = this.nodeFifoQueues[node];
+    if (!queue) return;
+    queue.push({ qty, shelfLife });
   }
 
-  private snapshotDelivered(): Record<ContractId, number> {
-    const out: Record<ContractId, number> = {};
-    for (const [id, cd] of Object.entries(this.contractDeliveries)) {
-      out[id] = cd.delivered;
+  private popFromNodeQueue(node: NodeId, qty: number): number {
+    const queue = this.nodeFifoQueues[node];
+    if (!queue) return INITIAL_SHELF_LIFE;
+    let remaining = qty;
+    let minShelfLife = Number.POSITIVE_INFINITY;
+    while (remaining > DELIVERY_EPSILON && queue.length > 0) {
+      const head = queue[0]!;
+      const take = Math.min(head.qty, remaining);
+      head.qty -= take;
+      remaining -= take;
+      if (head.shelfLife < minShelfLife) minShelfLife = head.shelfLife;
+      if (head.qty <= DELIVERY_EPSILON) queue.shift();
     }
-    return out;
+    return minShelfLife === Number.POSITIVE_INFINITY
+      ? 0
+      : minShelfLife;
+  }
+
+  private evaluateTrialDeadlines(): boolean {
+    let needsReplan = false;
+    for (const c of this.originalContracts) {
+      if (!c.trial) continue;
+      const cd = this.contractDeliveries[c.id]!;
+      if (cd.trialQualityPassed !== undefined) continue; // already evaluated
+      if (this.currentHour <= c.trial.dueByHour) continue; // not yet
+      const trialSubId = `${c.id}${TRIAL_SUFFIX}`;
+      const delivered = this.subContractDeliveries[trialSubId] ?? 0;
+      const fullyDelivered = delivered >= c.trial.quantity - DELIVERY_EPSILON;
+      const qualityOK =
+        cd.trialMinShelfLife >= c.trial.minShelfLifeAtDelivery;
+      const passed = fullyDelivered && qualityOK;
+      cd.trialQualityPassed = passed;
+      this.eventLog.push({
+        hour: this.currentHour,
+        kind: 'trial-evaluated',
+        detail: passed
+          ? `Trial passed for ${c.id} (delivered=${delivered.toFixed(0)}, minShelfLife=${cd.trialMinShelfLife.toFixed(1)}h)`
+          : `Trial FAILED for ${c.id} (delivered=${delivered.toFixed(0)} of ${c.trial.quantity}, minShelfLife=${cd.trialMinShelfLife === Infinity ? 'n/a' : cd.trialMinShelfLife.toFixed(1) + 'h'}; threshold=${c.trial.minShelfLifeAtDelivery}h)`,
+        contractId: c.id,
+      });
+      if (!passed) {
+        // Void the main sub-contract: zero its quantity for future replans.
+        const mainSub = this.expandedContracts.find(
+          (s) => s.id === `${c.id}::main`,
+        );
+        if (mainSub) mainSub.quantity = 0;
+        needsReplan = true;
+      }
+    }
+    return needsReplan;
+  }
+
+  private refreshAllStatuses(): void {
+    for (const c of this.originalContracts) {
+      const cd = this.contractDeliveries[c.id]!;
+      // Aggregate sub-contract delivered counts for display.
+      if (c.trial) {
+        cd.trialDelivered = this.subContractDeliveries[`${c.id}::trial`] ?? 0;
+        cd.mainDelivered = this.subContractDeliveries[`${c.id}::main`] ?? 0;
+      } else {
+        cd.trialDelivered = 0;
+        cd.mainDelivered = this.subContractDeliveries[c.id] ?? 0;
+      }
+      cd.delivered = cd.trialDelivered + cd.mainDelivered;
+      cd.status = deriveStatus(c, this.currentHour, cd, this.plan);
+    }
   }
 
   private applyEvent(e: SimEvent): void {
@@ -570,31 +608,112 @@ export class Simulator {
         }
         break;
       case 'spoilage-incident':
-        // Slice 5 will hook quality-state; no LP effect for now.
+        // No direct LP effect — quality already tracked per-shipment in slice 5.
         break;
     }
   }
 
-  private computeRealizedCost(): number {
-    // Realized cost ledger: transport (per shipment, with disruption-time price) +
-    // holding (sim-tracked inventory over the run) + breach * sum(shortfall).
-    // For slice 3 we use the latest plan's totalCost as the canonical figure
-    // since the deterministic LP computes it correctly given the current state.
-    return this.plan.totalCost;
+  private applyHazard(h: Hazard): void {
+    const fromHour = h.injectedAtHour;
+    const toHour = h.persistThroughHorizon
+      ? this.input.horizonHours
+      : h.injectedAtHour + h.durationHours;
+    const baseId = `disr-${h.id}`;
+    let n = 0;
+    const push = (
+      d: Omit<ActiveDisruption, 'id' | 'source' | 'sourceId' | 'fromHour' | 'toHour'>,
+    ) => {
+      this.activeDisruptions.push({
+        id: `${baseId}-${n++}`,
+        source: 'hazard',
+        sourceId: h.id,
+        fromHour,
+        toHour,
+        ...d,
+      });
+    };
+    switch (h.type) {
+      case 'strike':
+      case 'catastrophic-node-loss':
+      case 'weather-event':
+        if (h.targetNodeId) {
+          push({
+            nodeId: h.targetNodeId,
+            effectKind:
+              (h.capacityFactor ?? 0) === 0
+                ? 'block'
+                : 'capacity-factor',
+            capacityFactor: h.capacityFactor,
+          });
+        }
+        break;
+      case 'border-closure':
+      case 'sanctions':
+        for (const lid of h.targetLaneIds ?? []) {
+          push({
+            laneId: lid,
+            effectKind:
+              (h.capacityFactor ?? 0) === 0
+                ? 'block'
+                : 'capacity-factor',
+            capacityFactor: h.capacityFactor,
+          });
+        }
+        break;
+      case 'pandemic':
+        push({
+          effectKind: 'capacity-factor',
+          capacityFactor: h.capacityFactor,
+        });
+        break;
+      case 'equipment-recall':
+        if (h.blockMode) {
+          push({
+            mode: h.blockMode,
+            effectKind: 'block',
+          });
+        }
+        break;
+      case 'cyberattack':
+        push({
+          effectKind: 'capacity-factor',
+          capacityFactor: 1,
+        });
+        break;
+    }
   }
 }
+
+const INITIAL_SHELF_LIFE = 96;
 
 function deriveStatus(
   c: Contract,
   currentHour: number,
-  delivered: number,
-  plannedBreach: number,
+  cd: ContractDeliveryStatus,
+  plan: Plan,
 ): ContractStatus {
-  if (delivered >= c.quantity - DELIVERY_EPSILON) return 'delivered';
+  if (!c.trial) {
+    if (cd.delivered >= c.quantity - DELIVERY_EPSILON) return 'delivered';
+    if (currentHour > c.dueByHour) return 'breached';
+    const plannedBreach = plan.breachByContract[c.id] ?? 0;
+    if (plannedBreach > DELIVERY_EPSILON) return 'pending';
+    return 'on-track';
+  }
+  // Trial-bearing contract.
+  if (cd.trialQualityPassed === false) return 'voided';
+  if (
+    currentHour > c.trial.dueByHour &&
+    cd.trialDelivered < c.trial.quantity - DELIVERY_EPSILON &&
+    cd.trialQualityPassed === undefined
+  ) {
+    // Trial deadline passed without sufficient delivery and not yet evaluated.
+    // The evaluator will mark voided on the next refresh.
+    return 'voided';
+  }
+  if (cd.delivered >= c.quantity - DELIVERY_EPSILON) return 'delivered';
   if (currentHour > c.dueByHour) return 'breached';
-  if (plannedBreach > DELIVERY_EPSILON) return 'pending';
-  return 'on-track';
+  if (cd.trialQualityPassed === true) return 'main-active';
+  return 'trial-pending';
 }
 
-// Used by Simulator.applyEvent — re-export to keep import surface small.
 export type { Mode };

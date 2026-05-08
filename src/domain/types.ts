@@ -39,13 +39,27 @@ export interface Chain {
 
 export type ContractKind = 'committed' | 'opportunity';
 
+export interface ContractTrial {
+  /** Trial validation portion (typically 5–10% of the contract quantity). */
+  quantity: number;
+  /** Trial-shipment delivery deadline (must be earlier than main dueByHour). */
+  dueByHour: number;
+  /** Initial shelf-life of trial units when shipped (hours). */
+  initialShelfLife: number;
+  /** Minimum shelf-life remaining at trial-delivery for the trial to pass. */
+  minShelfLifeAtDelivery: number;
+}
+
 export interface Contract {
   id: ContractId;
   endpoint: NodeId;
   quantity: number;
+  /** Main delivery deadline. */
   dueByHour: number;
   revenue: number;
   kind: ContractKind;
+  /** When present, the contract follows the trial → main lifecycle. */
+  trial?: ContractTrial;
 }
 
 export interface Shipment {
@@ -56,6 +70,8 @@ export interface Shipment {
   releasedAtHour: number;
   arrivesAtHour: number;
   contractId?: ContractId;
+  /** Initial shelf-life snapshot at release; consumed during transit. */
+  shelfLifeAtRelease?: number;
 }
 
 export interface ShipmentCommitment {
