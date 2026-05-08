@@ -1,4 +1,4 @@
-export type Sector = 'food' | 'pharma';
+export type Sector = 'food' | 'pharma' | 'electronics';
 
 export type Mode = 'slow' | 'fast';
 

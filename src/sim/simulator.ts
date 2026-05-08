@@ -716,6 +716,8 @@ export class Simulator {
         }
         break;
       case 'regulatory-hold':
+      case 'customs-hold':
+      case 'esd-exception':
         if (e.targetNodeId) {
           push({
             fromHour,

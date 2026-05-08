@@ -24,11 +24,21 @@ const PHARMA: QualityModel = {
   decayPerLeg: () => 0,
 };
 
+const ELECTRONICS: QualityModel = {
+  // Electronics handling integrity: 1 = intact, 0 = damaged. No per-leg decay;
+  // esd-exception events affecting a node flip in-flight shipments arriving
+  // there (or routing through there).
+  initialAtOrigin: 1,
+  decayPerLeg: () => 0,
+};
+
 export function getQualityModel(sector: Sector): QualityModel {
   switch (sector) {
     case 'food':
       return FOOD;
     case 'pharma':
       return PHARMA;
+    case 'electronics':
+      return ELECTRONICS;
   }
 }
