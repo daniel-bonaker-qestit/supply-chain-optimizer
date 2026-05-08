@@ -34,38 +34,48 @@ export function App() {
         chain: def.chain,
         contracts: def.contracts,
         horizonHours: def.horizonHours,
+        seed,
       });
       if (myRunId !== runIdRef.current) return;
       simRef.current = sim;
       setSimState(sim.currentState());
-      scheduleTick(myRunId);
+      void runLoop(myRunId);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setStatus('error');
     }
   }
 
-  function scheduleTick(runId: number) {
-    setTimeout(() => {
-      if (runId !== runIdRef.current) return;
+  async function runLoop(runId: number) {
+    while (runId === runIdRef.current) {
       const sim = simRef.current;
       if (!sim) return;
       const state = sim.currentState();
       if (state.status === 'complete') {
-        setSimState(state);
         setStatus('complete');
+        setSimState(state);
         return;
       }
-      sim.step(state.currentHour);
+      try {
+        await sim.step(state.currentHour);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+        setStatus('error');
+        return;
+      }
+      if (runId !== runIdRef.current) return;
       setSimState(sim.currentState());
-      scheduleTick(runId);
-    }, HOUR_INTERVAL_MS);
+      await sleep(HOUR_INTERVAL_MS);
+    }
   }
 
   return (
     <main style={{ fontFamily: 'system-ui, sans-serif', padding: '1.5rem' }}>
       <h1>Supply Chain Optimizer</h1>
-      <p>Slice 1 — tracer bullet (food sector, single committed contract).</p>
+      <p>
+        Slice 3 — random events on a deterministic seeded timeline. The
+        optimizer replans on every event.
+      </p>
 
       <fieldset
         style={{
@@ -111,44 +121,57 @@ export function App() {
       )}
 
       {simState && (
-        <section style={{ marginTop: '1.5rem' }}>
-          <p>
-            <strong>Hour:</strong> {simState.currentHour} /{' '}
-            {simState.horizonHours}
-          </p>
-          <p>
-            <strong>Plan:</strong> {simState.plan.shipments.length} shipments
-            scheduled, {simState.plan.deliveries.length} deliveries
-          </p>
-          <p>
-            <strong>In flight:</strong> {simState.inFlight.length}
-          </p>
-          <ContractListPanel
-            simState={simState}
-            contractsById={Object.fromEntries(
-              getSectorDefinition(sector).contracts.map((c) => [c.id, c]),
-            )}
-          />
-          {simState.status === 'complete' && (
-            <p
-              data-testid="run-complete"
-              style={{
-                marginTop: '1rem',
-                padding: '0.75rem',
-                background: '#e8f5e9',
-                borderRadius: 4,
-              }}
-            >
-              <strong>Run complete — total cost: $
-              {simState.totalCost?.toFixed(2)}</strong>
+        <section
+          style={{
+            display: 'grid',
+            gap: '1.5rem',
+            gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)',
+            marginTop: '1.5rem',
+            alignItems: 'start',
+          }}
+        >
+          <div>
+            <p>
+              <strong>Hour:</strong> {simState.currentHour} /{' '}
+              {simState.horizonHours}
             </p>
-          )}
+            <p>
+              <strong>Plan:</strong> {simState.plan.shipments.length} shipments,{' '}
+              {simState.plan.deliveries.length} deliveries
+            </p>
+            <p>
+              <strong>In flight:</strong> {simState.inFlight.length} ·{' '}
+              <strong>Active disruptions:</strong>{' '}
+              {simState.activeDisruptions.length} ·{' '}
+              <strong>Events scheduled:</strong>{' '}
+              {simState.scheduledEvents.length}
+            </p>
+            <ContractListPanel
+              simState={simState}
+              contractsById={Object.fromEntries(
+                getSectorDefinition(sector).contracts.map((c) => [c.id, c]),
+              )}
+            />
+            {simState.status === 'complete' && (
+              <p
+                data-testid="run-complete"
+                style={{
+                  marginTop: '1rem',
+                  padding: '0.75rem',
+                  background: '#e8f5e9',
+                  borderRadius: 4,
+                }}
+              >
+                <strong>
+                  Run complete — total cost: $
+                  {simState.totalCost?.toFixed(2)}
+                </strong>
+              </p>
+            )}
+          </div>
+          <EventLogPanel simState={simState} />
         </section>
       )}
-
-      <footer style={{ marginTop: '2rem', fontSize: '0.85em', color: '#666' }}>
-        Seed (unused until events / opportunities land): <code>{seed}</code>
-      </footer>
     </main>
   );
 }
@@ -182,7 +205,6 @@ function ContractListPanel({
           borderCollapse: 'collapse',
           fontSize: '0.9em',
           width: '100%',
-          maxWidth: 640,
         }}
       >
         <thead>
@@ -224,6 +246,82 @@ function ContractListPanel({
       </table>
     </div>
   );
+}
+
+function EventLogPanel({ simState }: { simState: SimulationState }) {
+  const entries = simState.eventLog.slice().reverse();
+  return (
+    <div>
+      <h3 style={{ margin: '0 0 0.5rem 0' }}>Event log</h3>
+      <ul
+        style={{
+          listStyle: 'none',
+          padding: 0,
+          margin: 0,
+          maxHeight: '480px',
+          overflowY: 'auto',
+          border: '1px solid #ddd',
+          borderRadius: 4,
+          background: '#fafafa',
+        }}
+      >
+        {entries.length === 0 ? (
+          <li style={{ padding: '0.5rem 0.75rem', color: '#666' }}>
+            (no events yet)
+          </li>
+        ) : (
+          entries.map((e, i) => (
+            <li
+              key={`${e.hour}-${i}`}
+              style={{
+                padding: '0.4rem 0.75rem',
+                borderBottom: '1px solid #eee',
+                fontSize: '0.85em',
+              }}
+            >
+              <span
+                style={{
+                  display: 'inline-block',
+                  width: '4ch',
+                  color: '#666',
+                  fontVariantNumeric: 'tabular-nums',
+                }}
+              >
+                h{e.hour}
+              </span>
+              <span
+                style={{
+                  display: 'inline-block',
+                  marginLeft: '0.5rem',
+                  fontWeight: 600,
+                  color: kindColor(e.kind),
+                }}
+              >
+                {e.kind}
+              </span>
+              <span style={{ marginLeft: '0.5rem' }}>{e.detail}</span>
+            </li>
+          ))
+        )}
+      </ul>
+    </div>
+  );
+}
+
+function kindColor(kind: SimulationState['eventLog'][number]['kind']): string {
+  switch (kind) {
+    case 'event-fired':
+      return '#cf222e';
+    case 'replan':
+      return '#1f6feb';
+    case 'sim-start':
+    case 'sim-complete':
+      return '#1a7f37';
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 const cellHead: CSSProperties = {
