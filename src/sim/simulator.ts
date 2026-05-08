@@ -83,6 +83,11 @@ export interface SimulationState {
   inventory: Readonly<Record<NodeId, number>>;
   injectedHazards: readonly Hazard[];
   replanSuppressedUntilHour: number | undefined;
+  costHistory: ReadonlyArray<{
+    hour: number;
+    transport: number;
+    holding: number;
+  }>;
 }
 
 export interface SimulatorInput {
@@ -144,6 +149,11 @@ export class Simulator {
   private realizedTransport = 0;
   private realizedHolding = 0;
   private realizedBreach = 0;
+  private costHistory: Array<{
+    hour: number;
+    transport: number;
+    holding: number;
+  }> = [];
 
   private constructor(
     private readonly input: SimulatorInput,
@@ -316,6 +326,11 @@ export class Simulator {
     }
 
     this.accumulateHoldingCost();
+    this.costHistory.push({
+      hour: this.currentHour,
+      transport: this.realizedTransport,
+      holding: this.realizedHolding,
+    });
 
     this.refreshAllStatuses();
 
@@ -435,6 +450,7 @@ export class Simulator {
       inventory: { ...this.inventory },
       injectedHazards: this.injectedHazards.slice(),
       replanSuppressedUntilHour: this.replanSuppressedUntilHour,
+      costHistory: this.costHistory.slice(),
     };
   }
 
