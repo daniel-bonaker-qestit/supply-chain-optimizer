@@ -9,6 +9,8 @@ export type EventType =
   | 'contamination-alert'
   | 'refrigeration-failure'
   | 'regulatory-hold'
+  | 'customs-hold'
+  | 'esd-exception'
   | 'opportunity-arrival';
 
 export interface SimEvent {

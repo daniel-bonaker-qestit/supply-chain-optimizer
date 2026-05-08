@@ -17,10 +17,12 @@ const SHARED_TYPES: EventType[] = [
 
 const FOOD_TYPES: EventType[] = ['spoilage-incident', 'contamination-alert'];
 const PHARMA_TYPES: EventType[] = ['refrigeration-failure', 'regulatory-hold'];
+const ELECTRONICS_TYPES: EventType[] = ['customs-hold', 'esd-exception'];
 
 const SECTOR_TYPES: Record<Sector, readonly EventType[]> = {
   food: [...SHARED_TYPES, ...FOOD_TYPES],
   pharma: [...SHARED_TYPES, ...PHARMA_TYPES],
+  electronics: [...SHARED_TYPES, ...ELECTRONICS_TYPES],
 };
 
 const EVENTS_PER_WEEKDAY = 5;
@@ -249,6 +251,40 @@ function buildEvent(
         targetNodeId: node.id,
         capacityFactor: 0,
         description: `Regulatory hold at ${node.id} for ${baseDuration}h (outbound halted)`,
+        sector,
+      };
+    }
+    case 'customs-hold': {
+      const node = pick(rng, nonOrigin.length > 0 ? nonOrigin : chain.nodes);
+      return {
+        id,
+        type,
+        fireHour,
+        durationHours: baseDuration,
+        targetNodeId: node.id,
+        capacityFactor: 0,
+        description: `Customs / IP-clearance hold at ${node.id} for ${baseDuration}h`,
+        sector,
+      };
+    }
+    case 'esd-exception': {
+      // Designate a non-origin, non-endpoint node as ESD-non-equipped for the
+      // window. Optimizer must reroute around it.
+      const intermediate = nonOrigin.filter(
+        (n) => n.layer < (chain.nodes.length - 1),
+      );
+      const node = pick(
+        rng,
+        intermediate.length > 0 ? intermediate : nonOrigin,
+      );
+      return {
+        id,
+        type,
+        fireHour,
+        durationHours: baseDuration,
+        targetNodeId: node.id,
+        capacityFactor: 0,
+        description: `ESD exception at ${node.id} for ${baseDuration}h (outbound blocked, optimizer must reroute)`,
         sector,
       };
     }

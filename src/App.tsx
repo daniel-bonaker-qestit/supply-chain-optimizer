@@ -96,6 +96,7 @@ export function App() {
           >
             <option value="food">Food</option>
             <option value="pharma">Pharma cold-chain</option>
+            <option value="electronics">Electronics</option>
           </select>
         </label>
 

@@ -174,6 +174,65 @@ function pharmaCommittedContracts(): Contract[] {
   ];
 }
 
+function electronicsChain(): Chain {
+  const nodes: SupplyNode[] = [
+    { id: 'rare-earth', layer: 0, holdingCostPerUnitHour: 0.03, label: 'Rare-earth source' },
+    { id: 'component-mfg', layer: 1, holdingCostPerUnitHour: 0.08, label: 'Component manufacturer' },
+    { id: 'sub-assembly', layer: 2, holdingCostPerUnitHour: 0.1, label: 'Sub-assembly' },
+    { id: 'final-assembly', layer: 3, holdingCostPerUnitHour: 0.12, label: 'Final assembly' },
+    { id: 'export-warehouse', layer: 4, holdingCostPerUnitHour: 0.1, label: 'Export warehouse' },
+    { id: 'export-port', layer: 5, holdingCostPerUnitHour: 0.08, label: 'Export port' },
+    { id: 'sea-transit', layer: 6, holdingCostPerUnitHour: 0.05, label: 'Sea transit' },
+    { id: 'import-port', layer: 7, holdingCostPerUnitHour: 0.08, label: 'Import port' },
+    { id: 'customs-bonded', layer: 8, holdingCostPerUnitHour: 0.1, label: 'Customs-bonded warehouse' },
+    { id: 'national-dc', layer: 9, holdingCostPerUnitHour: 0.1, label: 'National DC' },
+    { id: 'regional-wh', layer: 10, holdingCostPerUnitHour: 0.12, label: 'Regional warehouse' },
+    { id: 'retail-store', layer: 11, holdingCostPerUnitHour: 0, label: 'Retail store (endpoint)' },
+  ];
+
+  // Sea (slow) and air (fast) modes per lane.
+  const lanes: Lane[] = [
+    lane('rare-earth->component-mfg', 'rare-earth', 'component-mfg', { transitHours: 6, costPerUnit: 0.4 }, { transitHours: 3, costPerUnit: 1.4 }, 800),
+    lane('component-mfg->sub-assembly', 'component-mfg', 'sub-assembly', { transitHours: 8, costPerUnit: 0.5 }, { transitHours: 4, costPerUnit: 1.6 }, 800),
+    lane('sub-assembly->final-assembly', 'sub-assembly', 'final-assembly', { transitHours: 10, costPerUnit: 0.6 }, { transitHours: 5, costPerUnit: 1.8 }, 800),
+    lane('final-assembly->export-warehouse', 'final-assembly', 'export-warehouse', { transitHours: 6, costPerUnit: 0.4 }, { transitHours: 3, costPerUnit: 1.2 }, 800),
+    lane('export-warehouse->export-port', 'export-warehouse', 'export-port', { transitHours: 4, costPerUnit: 0.3 }, { transitHours: 2, costPerUnit: 1.0 }, 800),
+    lane('export-port->sea-transit', 'export-port', 'sea-transit', { transitHours: 8, costPerUnit: 0.4 }, { transitHours: 4, costPerUnit: 1.4 }, 800),
+    lane('sea-transit->import-port', 'sea-transit', 'import-port', { transitHours: 60, costPerUnit: 0.5 }, { transitHours: 18, costPerUnit: 4.0 }, 800),
+    lane('import-port->customs-bonded', 'import-port', 'customs-bonded', { transitHours: 4, costPerUnit: 0.3 }, { transitHours: 2, costPerUnit: 1.0 }, 800),
+    lane('customs-bonded->national-dc', 'customs-bonded', 'national-dc', { transitHours: 6, costPerUnit: 0.4 }, { transitHours: 3, costPerUnit: 1.2 }, 800),
+    lane('national-dc->regional-wh', 'national-dc', 'regional-wh', { transitHours: 4, costPerUnit: 0.3 }, { transitHours: 2, costPerUnit: 1.0 }, 800),
+    lane('regional-wh->retail-store', 'regional-wh', 'retail-store', { transitHours: 2, costPerUnit: 0.2 }, { transitHours: 1, costPerUnit: 0.6 }, 800),
+  ];
+
+  return {
+    sector: 'electronics',
+    nodes,
+    lanes,
+    origins: ['rare-earth'],
+  };
+}
+
+function electronicsCommittedContracts(): Contract[] {
+  // Handling integrity: initial=1, threshold=1.
+  const trialFor = (mainDue: number, totalQty: number) => {
+    const dueByHour = Math.max(36, mainDue - 36);
+    const quantity = Math.max(1, Math.round(totalQty * 0.1));
+    return {
+      quantity,
+      dueByHour,
+      initialShelfLife: 1,
+      minShelfLifeAtDelivery: 1,
+    };
+  };
+
+  return [
+    { id: 'elec-c1', endpoint: 'retail-store', quantity: 300, dueByHour: 144, revenue: 25.0, kind: 'committed', trial: trialFor(144, 300) },
+    { id: 'elec-c2', endpoint: 'retail-store', quantity: 200, dueByHour: 156, revenue: 28.0, kind: 'committed', trial: trialFor(156, 200) },
+    { id: 'elec-c3', endpoint: 'retail-store', quantity: 150, dueByHour: 165, revenue: 22.0, kind: 'committed', trial: trialFor(165, 150) },
+  ];
+}
+
 export function getSectorDefinition(sector: Sector): SectorDefinition {
   switch (sector) {
     case 'food':
@@ -186,6 +245,12 @@ export function getSectorDefinition(sector: Sector): SectorDefinition {
       return {
         chain: pharmaChain(),
         contracts: pharmaCommittedContracts(),
+        horizonHours: 168,
+      };
+    case 'electronics':
+      return {
+        chain: electronicsChain(),
+        contracts: electronicsCommittedContracts(),
         horizonHours: 168,
       };
   }
