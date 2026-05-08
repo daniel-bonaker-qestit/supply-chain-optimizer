@@ -21,6 +21,7 @@ import {
   type PersistedRun,
   type RunSummary,
 } from './persistence/run-archive.ts';
+import { exportRunHTML } from './report/report-generator.ts';
 import { bufferTime } from './risk/risk-computer.ts';
 import {
   Simulator,
@@ -177,14 +178,30 @@ export function App() {
       const run = await loadRun(summary.id);
       if (!run) return;
       const blob = exportRunJSON(run);
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `${summary.id.replace(/::/g, '_')}.json`;
-      a.click();
-      URL.revokeObjectURL(url);
+      downloadBlob(blob, `${summary.id.replace(/::/g, '_')}.json`);
     })();
   }
+
+  function handleExportHTML(summary: RunSummary) {
+    void (async () => {
+      const run = await loadRun(summary.id);
+      if (!run) return;
+      const blob = exportRunHTML(run);
+      downloadBlob(blob, `${summary.id.replace(/::/g, '_')}.html`);
+    })();
+  }
+
+  // Hash-route: #/run/<id> loads a saved run for replay.
+  useEffect(() => {
+    const tryHashRoute = () => {
+      const hash = window.location.hash;
+      const m = hash.match(/^#\/run\/(.+)$/);
+      if (m) void loadAndReplay(decodeURIComponent(m[1]!));
+    };
+    tryHashRoute();
+    window.addEventListener('hashchange', tryHashRoute);
+    return () => window.removeEventListener('hashchange', tryHashRoute);
+  }, []);
 
   return (
     <main style={{ fontFamily: 'system-ui, sans-serif', padding: '1.5rem' }}>
@@ -374,6 +391,7 @@ export function App() {
         onLoad={(id) => void loadAndReplay(id)}
         onDelete={(id) => void handleDelete(id)}
         onExport={handleExport}
+        onExportHTML={handleExportHTML}
         onImport={handleImport}
       />
 
@@ -385,17 +403,28 @@ export function App() {
   );
 }
 
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 function SavedRunsPanel({
   runs,
   onLoad,
   onDelete,
   onExport,
+  onExportHTML,
   onImport,
 }: {
   runs: RunSummary[];
   onLoad: (id: string) => void;
   onDelete: (id: string) => void;
   onExport: (summary: RunSummary) => void;
+  onExportHTML: (summary: RunSummary) => void;
   onImport: (file: File) => void;
 }) {
   const fileRef = useRef<HTMLInputElement | null>(null);
@@ -456,7 +485,23 @@ function SavedRunsPanel({
                     Load
                   </button>{' '}
                   <button type="button" onClick={() => onExport(r)}>
-                    Export
+                    JSON
+                  </button>{' '}
+                  <button type="button" onClick={() => onExportHTML(r)}>
+                    HTML
+                  </button>{' '}
+                  <button
+                    type="button"
+                    onClick={() =>
+                      navigator.clipboard
+                        ?.writeText(
+                          `${window.location.origin}${window.location.pathname}#/run/${encodeURIComponent(r.id)}`,
+                        )
+                        .catch(() => undefined)
+                    }
+                    title="Copy deep link to clipboard"
+                  >
+                    Link
                   </button>{' '}
                   <button
                     type="button"
