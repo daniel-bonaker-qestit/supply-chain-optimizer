@@ -1,8 +1,26 @@
-import { useRef, useState, type CSSProperties } from 'react';
+import {
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+} from 'react';
 import { getSectorDefinition } from './domain/sector-defs.ts';
 import type { Contract, Sector } from './domain/types.ts';
 import { pickHazard } from './hazards/hazard-generator.ts';
 import type { Hazard } from './hazards/types.ts';
+import {
+  buildHazardFingerprint,
+  buildRunId,
+  deleteRun,
+  exportRunJSON,
+  importAndSaveRunJSON,
+  listRuns,
+  loadRun,
+  saveRun,
+  SCHEMA_VERSION,
+  type PersistedRun,
+  type RunSummary,
+} from './persistence/run-archive.ts';
 import { bufferTime } from './risk/risk-computer.ts';
 import {
   Simulator,
@@ -10,10 +28,17 @@ import {
   type SimulationState,
 } from './sim/simulator.ts';
 
-type AppStatus = 'idle' | 'running' | 'complete' | 'error';
+type AppStatus = 'idle' | 'running' | 'paused' | 'complete' | 'error' | 'replay';
 
 const DEFAULT_SEED = 'demo-1';
-const HOUR_INTERVAL_MS = 25;
+
+const SPEED_OPTIONS = [
+  { label: 'Max speed', value: 0 },
+  { label: '0.05 s / hour', value: 50 },
+  { label: '0.1 s / hour', value: 100 },
+  { label: '0.5 s / hour', value: 500 },
+  { label: '2 s / hour', value: 2000 },
+];
 
 export function App() {
   const [sector, setSector] = useState<Sector>('food');
@@ -21,13 +46,36 @@ export function App() {
   const [status, setStatus] = useState<AppStatus>('idle');
   const [simState, setSimState] = useState<SimulationState | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [hourIntervalMs, setHourIntervalMs] = useState<number>(25);
+  const [paused, setPaused] = useState<boolean>(false);
+  const [savedRuns, setSavedRuns] = useState<RunSummary[]>([]);
   const simRef = useRef<Simulator | null>(null);
   const runIdRef = useRef(0);
+  const pausedRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    pausedRef.current = paused;
+  }, [paused]);
+
+  useEffect(() => {
+    void refreshSavedRuns();
+  }, []);
+
+  async function refreshSavedRuns() {
+    try {
+      const list = await listRuns();
+      setSavedRuns(list);
+    } catch (e) {
+      // IndexedDB may be unavailable in some environments — don't surface as error.
+      console.warn('listRuns failed:', e);
+    }
+  }
 
   async function start() {
     const myRunId = ++runIdRef.current;
     setError(null);
     setStatus('running');
+    setPaused(false);
     setSimState(null);
     simRef.current = null;
 
@@ -57,8 +105,31 @@ export function App() {
       if (state.status === 'complete') {
         setStatus('complete');
         setSimState(state);
+        // Auto-save on completion.
+        try {
+          const hazardIds = state.injectedHazards.map((h) => h.id);
+          const fp = buildHazardFingerprint(hazardIds);
+          const id = buildRunId(sector, seed, fp);
+          const persisted: PersistedRun = {
+            schemaVersion: SCHEMA_VERSION,
+            id,
+            sector,
+            seed,
+            hazardFingerprint: fp,
+            savedAt: new Date().toISOString(),
+            state,
+          };
+          await saveRun(persisted);
+          await refreshSavedRuns();
+        } catch (e) {
+          console.warn('auto-save failed:', e);
+        }
         return;
       }
+      while (pausedRef.current && runId === runIdRef.current) {
+        await sleep(50);
+      }
+      if (runId !== runIdRef.current) return;
       try {
         await sim.step(state.currentHour);
       } catch (e) {
@@ -68,8 +139,51 @@ export function App() {
       }
       if (runId !== runIdRef.current) return;
       setSimState(sim.currentState());
-      await sleep(HOUR_INTERVAL_MS);
+      if (hourIntervalMs > 0) await sleep(hourIntervalMs);
     }
+  }
+
+  async function loadAndReplay(id: string) {
+    runIdRef.current++; // cancel any current run
+    simRef.current = null;
+    const run = await loadRun(id);
+    if (!run) {
+      setError(`Run ${id} not found`);
+      return;
+    }
+    setSimState(run.state);
+    setSector(run.sector);
+    setSeed(run.seed);
+    setStatus('replay');
+    setPaused(false);
+  }
+
+  async function handleDelete(id: string) {
+    await deleteRun(id);
+    await refreshSavedRuns();
+  }
+
+  async function handleImport(file: File) {
+    try {
+      await importAndSaveRunJSON(file);
+      await refreshSavedRuns();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  function handleExport(summary: RunSummary) {
+    void (async () => {
+      const run = await loadRun(summary.id);
+      if (!run) return;
+      const blob = exportRunJSON(run);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${summary.id.replace(/::/g, '_')}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    })();
   }
 
   return (
@@ -120,6 +234,56 @@ export function App() {
           {status === 'running' ? 'Running…' : 'Start'}
         </button>
       </fieldset>
+
+      {(status === 'running' || status === 'paused') && (
+        <fieldset
+          style={{
+            display: 'flex',
+            gap: '0.75rem',
+            alignItems: 'center',
+            marginTop: '0.75rem',
+            padding: '0.5rem 1rem',
+          }}
+        >
+          <label>
+            Speed{' '}
+            <select
+              value={hourIntervalMs}
+              onChange={(e) => setHourIntervalMs(Number(e.target.value))}
+            >
+              {SPEED_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            type="button"
+            onClick={() => {
+              setPaused((p) => !p);
+              setStatus(paused ? 'running' : 'paused');
+            }}
+          >
+            {paused ? 'Resume' : 'Pause'}
+          </button>
+        </fieldset>
+      )}
+
+      {status === 'replay' && (
+        <p
+          style={{
+            marginTop: '0.75rem',
+            padding: '0.5rem 0.75rem',
+            background: '#fff8e1',
+            border: '1px solid #f59f00',
+            borderRadius: 4,
+            color: '#9a6700',
+          }}
+        >
+          <strong>Replay mode:</strong> viewing a saved run (read-only).
+        </p>
+      )}
 
       {simState && simState.status === 'running' && (
         <button
@@ -204,7 +368,110 @@ export function App() {
           <EventLogPanel simState={simState} />
         </section>
       )}
+
+      <SavedRunsPanel
+        runs={savedRuns}
+        onLoad={(id) => void loadAndReplay(id)}
+        onDelete={(id) => void handleDelete(id)}
+        onExport={handleExport}
+        onImport={handleImport}
+      />
+
+      <footer style={{ marginTop: '2rem', fontSize: '0.85em', color: '#666' }}>
+        Seed: <code>{seed}</code> · {savedRuns.length} run
+        {savedRuns.length === 1 ? '' : 's'} stored locally
+      </footer>
     </main>
+  );
+}
+
+function SavedRunsPanel({
+  runs,
+  onLoad,
+  onDelete,
+  onExport,
+  onImport,
+}: {
+  runs: RunSummary[];
+  onLoad: (id: string) => void;
+  onDelete: (id: string) => void;
+  onExport: (summary: RunSummary) => void;
+  onImport: (file: File) => void;
+}) {
+  const fileRef = useRef<HTMLInputElement | null>(null);
+  return (
+    <section style={{ marginTop: '2rem' }}>
+      <h3 style={{ margin: '0 0 0.5rem 0' }}>Saved runs</h3>
+      <div style={{ marginBottom: '0.5rem' }}>
+        <input
+          ref={fileRef}
+          type="file"
+          accept="application/json"
+          style={{ display: 'none' }}
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (f) onImport(f);
+            e.target.value = '';
+          }}
+        />
+        <button type="button" onClick={() => fileRef.current?.click()}>
+          Import JSON
+        </button>
+      </div>
+      {runs.length === 0 ? (
+        <p style={{ color: '#666' }}>(no saved runs yet)</p>
+      ) : (
+        <table
+          style={{
+            borderCollapse: 'collapse',
+            fontSize: '0.85em',
+            width: '100%',
+            maxWidth: 760,
+          }}
+        >
+          <thead>
+            <tr>
+              <th style={cellHead}>Saved</th>
+              <th style={cellHead}>Sector</th>
+              <th style={cellHead}>Seed</th>
+              <th style={cellHead}>Cost</th>
+              <th style={cellHead}>Contracts</th>
+              <th style={cellHead}>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {runs.map((r) => (
+              <tr key={r.id}>
+                <td style={cell}>{r.savedAt.slice(0, 19).replace('T', ' ')}</td>
+                <td style={cell}>{r.sector}</td>
+                <td style={cell}>{r.seed}</td>
+                <td style={cell}>
+                  {r.totalCost === undefined
+                    ? '—'
+                    : `$${r.totalCost.toFixed(0)}`}
+                </td>
+                <td style={cell}>{r.contractsCount}</td>
+                <td style={cell}>
+                  <button type="button" onClick={() => onLoad(r.id)}>
+                    Load
+                  </button>{' '}
+                  <button type="button" onClick={() => onExport(r)}>
+                    Export
+                  </button>{' '}
+                  <button
+                    type="button"
+                    onClick={() => onDelete(r.id)}
+                    style={{ color: '#cf222e' }}
+                  >
+                    Delete
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </section>
   );
 }
 
