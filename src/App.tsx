@@ -3,6 +3,7 @@ import { getSectorDefinition } from './domain/sector-defs.ts';
 import type { Contract, Sector } from './domain/types.ts';
 import { pickHazard } from './hazards/hazard-generator.ts';
 import type { Hazard } from './hazards/types.ts';
+import { bufferTime } from './risk/risk-computer.ts';
 import {
   Simulator,
   type ContractStatus,
@@ -175,6 +176,8 @@ export function App() {
               <strong>Events scheduled:</strong>{' '}
               {simState.scheduledEvents.length}
             </p>
+            <NetworkGraph sector={sector} simState={simState} />
+            <CostChart simState={simState} />
             <ContractListPanel
               simState={simState}
               contractsById={Object.fromEntries(
@@ -227,7 +230,8 @@ function ContractListPanel({
     const c = contractsById[cd.contractId];
     if (!c) return null;
     const breachQty = simState.plan.breachByContract[cd.contractId] ?? 0;
-    return { contract: c, status: cd, breach: breachQty };
+    const buffer = bufferTime(simState.plan, c);
+    return { contract: c, status: cd, breach: breachQty, buffer };
   });
 
   return (
@@ -246,6 +250,7 @@ function ContractListPanel({
             <th style={cellHead}>Endpoint</th>
             <th style={cellHead}>Qty</th>
             <th style={cellHead}>Due</th>
+            <th style={cellHead}>Buffer</th>
             <th style={cellHead}>Delivered</th>
             <th style={cellHead}>Planned breach</th>
             <th style={cellHead}>Status</th>
@@ -259,6 +264,24 @@ function ContractListPanel({
                 <td style={cell}>{r.contract.endpoint}</td>
                 <td style={cell}>{r.contract.quantity}</td>
                 <td style={cell}>h{r.contract.dueByHour}</td>
+                <td
+                  style={{
+                    ...cell,
+                    color:
+                      r.buffer === Number.POSITIVE_INFINITY
+                        ? '#888'
+                        : r.buffer < 0
+                          ? '#cf222e'
+                          : r.buffer < 6
+                            ? '#9a6700'
+                            : '#1a7f37',
+                    fontWeight: 600,
+                  }}
+                >
+                  {r.buffer === Number.POSITIVE_INFINITY
+                    ? '—'
+                    : `${r.buffer >= 0 ? '+' : ''}${r.buffer.toFixed(0)}h`}
+                </td>
                 <td style={cell}>{r.status.delivered.toFixed(0)}</td>
                 <td style={cell}>
                   {r.breach > 1e-6 ? r.breach.toFixed(0) : '—'}
@@ -277,6 +300,179 @@ function ContractListPanel({
           )}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+function CostChart({ simState }: { simState: SimulationState }) {
+  const samples = simState.costHistory;
+  if (samples.length < 2) return null;
+
+  const W = 480;
+  const H = 120;
+  const pad = 24;
+
+  const totals = samples.map((s: { transport: number; holding: number }) =>
+    s.transport + s.holding,
+  );
+  const transports = samples.map(
+    (s: { transport: number }) => s.transport,
+  );
+  const holdings = samples.map((s: { holding: number }) => s.holding);
+
+  const xMax = simState.horizonHours;
+  const yMax = Math.max(1, ...totals);
+
+  const xFor = (h: number) => pad + ((W - pad * 2) * h) / xMax;
+  const yFor = (v: number) => H - pad - ((H - pad * 2) * v) / yMax;
+
+  const buildPath = (vals: number[]) =>
+    samples
+      .map(
+        (s: { hour: number }, i: number) =>
+          `${i === 0 ? 'M' : 'L'} ${xFor(s.hour)} ${yFor(vals[i]!)}`,
+      )
+      .join(' ');
+
+  return (
+    <div style={{ marginTop: '1rem' }}>
+      <h3 style={{ margin: '0 0 0.5rem 0' }}>Realized cost over time</h3>
+      <svg
+        width={W}
+        height={H}
+        style={{ background: '#fafafa', border: '1px solid #ddd' }}
+      >
+        <line x1={pad} y1={H - pad} x2={W - pad} y2={H - pad} stroke="#999" />
+        <line x1={pad} y1={pad} x2={pad} y2={H - pad} stroke="#999" />
+        <path
+          d={buildPath(transports)}
+          stroke="#1f6feb"
+          strokeWidth={2}
+          fill="none"
+        />
+        <path
+          d={buildPath(holdings)}
+          stroke="#9a6700"
+          strokeWidth={2}
+          fill="none"
+        />
+        <path
+          d={buildPath(totals)}
+          stroke="#1a7f37"
+          strokeWidth={2}
+          fill="none"
+        />
+        <text x={pad} y={pad - 6} fontSize="11" fill="#444">
+          ${yMax.toFixed(0)}
+        </text>
+        <text x={W - pad - 50} y={H - pad + 14} fontSize="11" fill="#444">
+          h{xMax}
+        </text>
+      </svg>
+      <div style={{ fontSize: '0.8em', marginTop: 4 }}>
+        <span style={{ color: '#1f6feb' }}>● transport</span>{' '}
+        <span style={{ color: '#9a6700', marginLeft: 12 }}>● holding</span>{' '}
+        <span style={{ color: '#1a7f37', marginLeft: 12 }}>● total</span>
+      </div>
+    </div>
+  );
+}
+
+function NetworkGraph({
+  sector,
+  simState,
+}: {
+  sector: Sector;
+  simState: SimulationState;
+}) {
+  const def = getSectorDefinition(sector);
+  const W = 520;
+  const H = 200;
+  const pad = 30;
+  const layers = new Map<number, typeof def.chain.nodes>();
+  for (const n of def.chain.nodes) {
+    if (!layers.has(n.layer)) layers.set(n.layer, []);
+    layers.get(n.layer)!.push(n);
+  }
+  const maxLayer = Math.max(...def.chain.nodes.map((n) => n.layer));
+  const xFor = (l: number) =>
+    maxLayer === 0 ? W / 2 : pad + ((W - pad * 2) * l) / maxLayer;
+  const yFor = (idx: number, count: number) =>
+    pad + ((H - pad * 2) * (idx + 0.5)) / Math.max(count, 1);
+
+  const positions = new Map<string, { x: number; y: number }>();
+  for (const [layer, nodes] of layers) {
+    nodes.forEach((n, i) =>
+      positions.set(n.id, { x: xFor(layer), y: yFor(i, nodes.length) }),
+    );
+  }
+
+  const disruptedNodes = new Set<string>();
+  const disruptedLanes = new Set<string>();
+  for (const d of simState.activeDisruptions) {
+    if (simState.currentHour < d.fromHour || simState.currentHour >= d.toHour)
+      continue;
+    if (d.nodeId) disruptedNodes.add(d.nodeId);
+    if (d.laneId) disruptedLanes.add(d.laneId);
+  }
+
+  return (
+    <div style={{ marginTop: '1rem' }}>
+      <h3 style={{ margin: '0 0 0.5rem 0' }}>Network</h3>
+      <svg width={W} height={H} style={{ background: '#fafafa', border: '1px solid #ddd' }}>
+        {def.chain.lanes.map((l) => {
+          const a = positions.get(l.from);
+          const b = positions.get(l.to);
+          if (!a || !b) return null;
+          const blocked = disruptedLanes.has(l.id);
+          return (
+            <line
+              key={l.id}
+              x1={a.x}
+              y1={a.y}
+              x2={b.x}
+              y2={b.y}
+              stroke={blocked ? '#cf222e' : '#888'}
+              strokeWidth={blocked ? 2 : 1}
+              strokeDasharray={blocked ? '4 2' : undefined}
+            />
+          );
+        })}
+        {def.chain.nodes.map((n) => {
+          const p = positions.get(n.id)!;
+          const isOrigin = def.chain.origins.includes(n.id);
+          const isEndpoint = n.layer === maxLayer;
+          const blocked = disruptedNodes.has(n.id);
+          const fill = blocked
+            ? '#cf222e'
+            : isOrigin
+              ? '#1a7f37'
+              : isEndpoint
+                ? '#1f6feb'
+                : '#fff';
+          return (
+            <g key={n.id}>
+              <circle
+                cx={p.x}
+                cy={p.y}
+                r={6}
+                fill={fill}
+                stroke="#333"
+                strokeWidth={1}
+              />
+              <text
+                x={p.x}
+                y={p.y - 10}
+                fontSize="9"
+                textAnchor="middle"
+                fill="#333"
+              >
+                {n.id}
+              </text>
+            </g>
+          );
+        })}
+      </svg>
     </div>
   );
 }
