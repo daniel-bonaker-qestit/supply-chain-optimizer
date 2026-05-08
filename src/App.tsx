@@ -1,6 +1,8 @@
 import { useRef, useState, type CSSProperties } from 'react';
 import { getSectorDefinition } from './domain/sector-defs.ts';
 import type { Contract, Sector } from './domain/types.ts';
+import { pickHazard } from './hazards/hazard-generator.ts';
+import type { Hazard } from './hazards/types.ts';
 import {
   Simulator,
   type ContractStatus,
@@ -115,6 +117,31 @@ export function App() {
           {status === 'running' ? 'Running…' : 'Start'}
         </button>
       </fieldset>
+
+      {simState && simState.status === 'running' && (
+        <button
+          type="button"
+          onClick={() => {
+            void injectRandomHazard(simRef.current, sector, simState);
+          }}
+          style={{
+            marginTop: '1rem',
+            padding: '0.6rem 1rem',
+            background: '#cf222e',
+            color: 'white',
+            border: 'none',
+            borderRadius: 4,
+            fontWeight: 600,
+            cursor: 'pointer',
+          }}
+        >
+          Inject Random Hazard
+        </button>
+      )}
+
+      {simState && simState.injectedHazards.length > 0 && (
+        <ActiveHazardBanner simState={simState} />
+      )}
 
       {error && (
         <pre style={{ color: 'crimson', marginTop: '1rem' }}>Error: {error}</pre>
@@ -308,12 +335,74 @@ function EventLogPanel({ simState }: { simState: SimulationState }) {
   );
 }
 
+async function injectRandomHazard(
+  sim: Simulator | null,
+  sector: Sector,
+  simState: SimulationState,
+): Promise<void> {
+  if (!sim) return;
+  try {
+    const def = getSectorDefinition(sector);
+    const hazard = pickHazard({
+      sector,
+      chain: def.chain,
+      currentHour: simState.currentHour,
+      horizonHours: simState.horizonHours,
+    });
+    await sim.injectHazard(hazard);
+  } catch (e) {
+    console.error('hazard injection failed:', e);
+  }
+}
+
+function ActiveHazardBanner({ simState }: { simState: SimulationState }) {
+  const active = simState.injectedHazards.filter((h: Hazard) => {
+    const end = h.persistThroughHorizon
+      ? simState.horizonHours
+      : h.injectedAtHour + h.durationHours;
+    return simState.currentHour < end;
+  });
+  if (active.length === 0) return null;
+  return (
+    <div
+      style={{
+        marginTop: '1rem',
+        padding: '0.75rem',
+        background: '#fff5f5',
+        border: '1px solid #cf222e',
+        borderLeft: '6px solid #cf222e',
+        borderRadius: 4,
+      }}
+    >
+      <strong style={{ color: '#a40e26' }}>Active hazards:</strong>
+      <ul style={{ margin: '0.4rem 0 0 1.25rem', padding: 0 }}>
+        {active.map((h) => (
+          <li key={h.id} style={{ marginBottom: '0.2rem' }}>
+            <strong>{h.type}</strong>: {h.description}
+          </li>
+        ))}
+      </ul>
+      {simState.replanSuppressedUntilHour !== undefined &&
+        simState.currentHour < simState.replanSuppressedUntilHour && (
+          <p style={{ marginTop: '0.4rem', color: '#9a6700' }}>
+            Visibility blackout active — replans suppressed until h
+            {simState.replanSuppressedUntilHour}.
+          </p>
+        )}
+    </div>
+  );
+}
+
 function kindColor(kind: SimulationState['eventLog'][number]['kind']): string {
   switch (kind) {
     case 'event-fired':
       return '#cf222e';
     case 'replan':
       return '#1f6feb';
+    case 'replan-suppressed':
+      return '#9a6700';
+    case 'hazard-injected':
+      return '#a40e26';
     case 'sim-start':
     case 'sim-complete':
       return '#1a7f37';

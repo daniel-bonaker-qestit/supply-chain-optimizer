@@ -15,6 +15,7 @@ import type {
   ActiveDisruption,
   SimEvent,
 } from '../events/types.ts';
+import type { Hazard } from '../hazards/types.ts';
 import { solve } from '../optimizer/optimizer.ts';
 
 export type SimulationStatus = 'running' | 'complete';
@@ -32,9 +33,16 @@ export interface ContractDeliveryStatus {
 
 export interface EventLogEntry {
   hour: number;
-  kind: 'event-fired' | 'replan' | 'sim-start' | 'sim-complete';
+  kind:
+    | 'event-fired'
+    | 'replan'
+    | 'sim-start'
+    | 'sim-complete'
+    | 'hazard-injected'
+    | 'replan-suppressed';
   detail: string;
   eventId?: string;
+  hazardId?: string;
 }
 
 export interface SimulationState {
@@ -53,6 +61,10 @@ export interface SimulationState {
   eventLog: readonly EventLogEntry[];
   /** Per-non-origin-node on-hand inventory. */
   inventory: Readonly<Record<NodeId, number>>;
+  /** Hazards injected into this run, in injection order. */
+  injectedHazards: readonly Hazard[];
+  /** If a cyberattack is active, replans are suppressed until this hour. */
+  replanSuppressedUntilHour: number | undefined;
 }
 
 export interface SimulatorInput {
@@ -85,6 +97,8 @@ export class Simulator {
   private activeDisruptions: ActiveDisruption[] = [];
   private eventLog: EventLogEntry[] = [];
   private plan: Plan;
+  private injectedHazards: Hazard[] = [];
+  private replanSuppressedUntilHour: number | undefined;
 
   private constructor(
     private readonly input: SimulatorInput,
@@ -201,7 +215,16 @@ export class Simulator {
     this.currentHour = h + 1;
 
     if (needsReplan && this.currentHour < this.input.horizonHours) {
-      await this.replan();
+      if (this.isReplanSuppressed(this.currentHour)) {
+        this.eventLog.push({
+          hour: this.currentHour,
+          kind: 'replan-suppressed',
+          detail:
+            'Cyberattack visibility blackout active — replan deferred until blackout ends',
+        });
+      } else {
+        await this.replan();
+      }
     }
 
     this.refreshAllStatuses();
@@ -250,7 +273,125 @@ export class Simulator {
       activeDisruptions: this.activeDisruptions.slice(),
       eventLog: this.eventLog.slice(),
       inventory: { ...this.inventory },
+      injectedHazards: this.injectedHazards.slice(),
+      replanSuppressedUntilHour: this.replanSuppressedUntilHour,
     };
+  }
+
+  async injectHazard(hazard: Hazard): Promise<void> {
+    if (this.status === 'complete') {
+      throw new Error('cannot inject hazard into a completed simulation');
+    }
+    this.injectedHazards.push(hazard);
+    this.applyHazard(hazard);
+    this.eventLog.push({
+      hour: this.currentHour,
+      kind: 'hazard-injected',
+      detail: hazard.description,
+      hazardId: hazard.id,
+    });
+
+    if (hazard.blocksReplans) {
+      // A new cyberattack extends or sets the suppression window.
+      const until = hazard.injectedAtHour + hazard.durationHours;
+      this.replanSuppressedUntilHour = Math.max(
+        this.replanSuppressedUntilHour ?? 0,
+        until,
+      );
+    }
+
+    if (
+      this.currentHour < this.input.horizonHours &&
+      !this.isReplanSuppressed(this.currentHour)
+    ) {
+      await this.replan();
+    } else if (this.isReplanSuppressed(this.currentHour)) {
+      this.eventLog.push({
+        hour: this.currentHour,
+        kind: 'replan-suppressed',
+        detail:
+          'Cyberattack visibility blackout active — hazard-triggered replan deferred',
+      });
+    }
+  }
+
+  private isReplanSuppressed(hour: number): boolean {
+    return (
+      this.replanSuppressedUntilHour !== undefined &&
+      hour < this.replanSuppressedUntilHour
+    );
+  }
+
+  private applyHazard(h: Hazard): void {
+    const fromHour = h.injectedAtHour;
+    const toHour = h.persistThroughHorizon
+      ? this.input.horizonHours
+      : h.injectedAtHour + h.durationHours;
+    const baseId = `disr-${h.id}`;
+    let n = 0;
+    const push = (
+      d: Omit<ActiveDisruption, 'id' | 'source' | 'sourceId' | 'fromHour' | 'toHour'>,
+    ) => {
+      this.activeDisruptions.push({
+        id: `${baseId}-${n++}`,
+        source: 'hazard',
+        sourceId: h.id,
+        fromHour,
+        toHour,
+        ...d,
+      });
+    };
+    switch (h.type) {
+      case 'strike':
+      case 'catastrophic-node-loss':
+      case 'weather-event':
+        if (h.targetNodeId) {
+          push({
+            nodeId: h.targetNodeId,
+            effectKind:
+              (h.capacityFactor ?? 0) === 0
+                ? 'block'
+                : 'capacity-factor',
+            capacityFactor: h.capacityFactor,
+          });
+        }
+        break;
+      case 'border-closure':
+      case 'sanctions':
+        for (const lid of h.targetLaneIds ?? []) {
+          push({
+            laneId: lid,
+            effectKind:
+              (h.capacityFactor ?? 0) === 0
+                ? 'block'
+                : 'capacity-factor',
+            capacityFactor: h.capacityFactor,
+          });
+        }
+        break;
+      case 'pandemic':
+        push({
+          effectKind: 'capacity-factor',
+          capacityFactor: h.capacityFactor,
+        });
+        break;
+      case 'equipment-recall':
+        if (h.blockMode) {
+          push({
+            mode: h.blockMode,
+            effectKind: 'block',
+          });
+        }
+        break;
+      case 'cyberattack':
+        // No state-disruption — only a replan-suppression window. We still
+        // record the disruption with a no-op effect so the UI can surface it.
+        push({
+          effectKind: 'capacity-factor',
+          capacityFactor: 1,
+        });
+        break;
+    }
   }
 
   private indexPlan(plan: Plan): void {
