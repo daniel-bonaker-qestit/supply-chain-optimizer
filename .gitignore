@@ -21,6 +21,11 @@ coverage/
 *.tsbuildinfo
 .npm/
 .pnpm-store/
+.vite/
+.vitest-cache/
+
+# Copied at build time from node_modules/highs/build/
+public/highs.wasm
 
 # Python
 __pycache__/
