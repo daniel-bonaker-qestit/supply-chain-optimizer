@@ -1,0 +1,155 @@
+import type {
+  Chain,
+  Contract,
+  ContractId,
+  Plan,
+  Shipment,
+} from '../domain/types.ts';
+import { solve } from '../optimizer/optimizer.ts';
+
+export type SimulationStatus = 'running' | 'complete';
+
+export interface ContractDeliveryStatus {
+  contractId: ContractId;
+  delivered: number;
+  status: 'pending' | 'delivered';
+}
+
+export interface SimulationState {
+  currentHour: number;
+  horizonHours: number;
+  status: SimulationStatus;
+  plan: Plan;
+  inFlight: readonly Shipment[];
+  contractDeliveries: Readonly<Record<ContractId, ContractDeliveryStatus>>;
+  totalCost: number | undefined;
+}
+
+export interface SimulatorInput {
+  chain: Chain;
+  contracts: Contract[];
+  horizonHours: number;
+}
+
+const DELIVERY_EPSILON = 1e-6;
+
+export class Simulator {
+  private currentHour = 0;
+  private status: SimulationStatus = 'running';
+  private inFlight: Shipment[] = [];
+  private contractDeliveries: Record<ContractId, ContractDeliveryStatus>;
+  private totalCost: number | undefined = undefined;
+  private plannedByReleaseHour: Map<number, Plan['shipments']>;
+  private contractsById: Map<ContractId, Contract>;
+  private shipmentCounter = 0;
+
+  private constructor(
+    private readonly input: SimulatorInput,
+    private readonly plan: Plan,
+  ) {
+    this.contractsById = new Map(input.contracts.map((c) => [c.id, c]));
+    this.contractDeliveries = Object.fromEntries(
+      input.contracts.map((c) => [
+        c.id,
+        { contractId: c.id, delivered: 0, status: 'pending' as const },
+      ]),
+    );
+    this.plannedByReleaseHour = new Map();
+    for (const s of plan.shipments) {
+      const list = this.plannedByReleaseHour.get(s.releaseHour) ?? [];
+      list.push(s);
+      this.plannedByReleaseHour.set(s.releaseHour, list);
+    }
+  }
+
+  static async start(input: SimulatorInput): Promise<Simulator> {
+    const plan = await solve({
+      chain: input.chain,
+      contracts: input.contracts,
+      currentHour: 0,
+      horizonHours: input.horizonHours,
+      inFlight: [],
+      delivered: {},
+    });
+    return new Simulator(input, plan);
+  }
+
+  step(h: number): void {
+    if (this.status === 'complete') {
+      throw new Error('step called on a completed simulation');
+    }
+    if (h !== this.currentHour) {
+      throw new Error(
+        `step called with hour ${h}, expected ${this.currentHour}`,
+      );
+    }
+    if (h >= this.input.horizonHours) {
+      throw new Error(`step called beyond horizon ${this.input.horizonHours}`);
+    }
+
+    this.processArrivals(h);
+    this.processReleases(h);
+
+    this.currentHour = h + 1;
+    if (this.currentHour >= this.input.horizonHours) {
+      this.status = 'complete';
+      this.totalCost = this.plan.totalCost;
+    }
+  }
+
+  currentState(): SimulationState {
+    return {
+      currentHour: this.currentHour,
+      horizonHours: this.input.horizonHours,
+      status: this.status,
+      plan: this.plan,
+      inFlight: this.inFlight.slice(),
+      contractDeliveries: { ...this.contractDeliveries },
+      totalCost: this.totalCost,
+    };
+  }
+
+  private processArrivals(h: number): void {
+    const remaining: Shipment[] = [];
+    for (const s of this.inFlight) {
+      if (s.arrivesAtHour !== h) {
+        remaining.push(s);
+        continue;
+      }
+      if (s.contractId !== undefined) {
+        const status = this.contractDeliveries[s.contractId];
+        if (status) {
+          status.delivered += s.quantity;
+          const c = this.contractsById.get(s.contractId);
+          if (c && status.delivered >= c.quantity - DELIVERY_EPSILON) {
+            status.status = 'delivered';
+          }
+        }
+      }
+    }
+    this.inFlight = remaining;
+  }
+
+  private processReleases(h: number): void {
+    const due = this.plannedByReleaseHour.get(h);
+    if (!due) return;
+    for (const sc of due) {
+      const lane = this.input.chain.lanes.find((l) => l.id === sc.laneId);
+      if (!lane) {
+        throw new Error(
+          `Plan references unknown lane ${sc.laneId} at hour ${h}`,
+        );
+      }
+      const transit = lane.modes[sc.mode].transitHours;
+      this.inFlight.push({
+        id: `ship-${this.shipmentCounter++}`,
+        laneId: sc.laneId,
+        mode: sc.mode,
+        quantity: sc.quantity,
+        releasedAtHour: sc.releaseHour,
+        arrivesAtHour: sc.releaseHour + transit,
+        contractId: sc.contractId,
+      });
+    }
+  }
+}
