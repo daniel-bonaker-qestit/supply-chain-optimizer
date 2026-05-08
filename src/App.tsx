@@ -95,6 +95,7 @@ export function App() {
             disabled={status === 'running'}
           >
             <option value="food">Food</option>
+            <option value="pharma">Pharma cold-chain</option>
           </select>
         </label>
 

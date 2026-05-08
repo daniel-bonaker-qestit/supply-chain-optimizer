@@ -7,6 +7,8 @@ export type EventType =
   | 'price-spike'
   | 'spoilage-incident'
   | 'contamination-alert'
+  | 'refrigeration-failure'
+  | 'regulatory-hold'
   | 'opportunity-arrival';
 
 export interface SimEvent {
