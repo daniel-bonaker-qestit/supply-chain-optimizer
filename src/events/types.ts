@@ -1,4 +1,4 @@
-import type { Mode, Sector } from '../domain/types.ts';
+import type { Contract, Mode, Sector } from '../domain/types.ts';
 
 export type EventType =
   | 'origin-warehouse-delay'
@@ -6,7 +6,8 @@ export type EventType =
   | 'mode-disruption'
   | 'price-spike'
   | 'spoilage-incident'
-  | 'contamination-alert';
+  | 'contamination-alert'
+  | 'opportunity-arrival';
 
 export interface SimEvent {
   id: string;
@@ -29,6 +30,8 @@ export interface SimEvent {
   priceMultiplier?: number;
   /** Mode to block for mode-disruption. */
   blockMode?: Mode;
+  /** Opportunity contract attached to an opportunity-arrival event. */
+  opportunityContract?: Contract;
   /** Human-readable description for the event log. */
   description: string;
   sector: Sector;

@@ -211,6 +211,7 @@ const STATUS_COLORS: Record<ContractStatus, string> = {
   'trial-pending': '#8250df',
   'main-active': '#0969da',
   voided: '#6e7781',
+  declined: '#57606a',
 };
 
 function ContractListPanel({
@@ -408,6 +409,12 @@ function kindColor(kind: SimulationState['eventLog'][number]['kind']): string {
       return '#a40e26';
     case 'trial-evaluated':
       return '#8250df';
+    case 'opportunity-arrived':
+      return '#0969da';
+    case 'opportunity-accepted':
+      return '#1a7f37';
+    case 'opportunity-declined':
+      return '#57606a';
     case 'sim-start':
     case 'sim-complete':
       return '#1a7f37';

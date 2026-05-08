@@ -32,7 +32,8 @@ export type ContractStatus =
   | 'breached'
   | 'trial-pending'
   | 'main-active'
-  | 'voided';
+  | 'voided'
+  | 'declined';
 
 export interface ContractDeliveryStatus {
   contractId: ContractId;
@@ -55,7 +56,10 @@ export interface EventLogEntry {
     | 'sim-complete'
     | 'hazard-injected'
     | 'replan-suppressed'
-    | 'trial-evaluated';
+    | 'trial-evaluated'
+    | 'opportunity-arrived'
+    | 'opportunity-accepted'
+    | 'opportunity-declined';
   detail: string;
   eventId?: string;
   hazardId?: string;
@@ -119,6 +123,8 @@ export class Simulator {
   /** Working copy of the expanded sub-contract list passed to the optimizer. */
   private expandedContracts: Contract[];
   private subRefs: Map<ContractId, SubContractRef>;
+  private pendingOpportunityIds: Set<ContractId> = new Set();
+  private declinedOpportunityIds: Set<ContractId> = new Set();
 
   private constructor(
     private readonly input: SimulatorInput,
@@ -236,13 +242,24 @@ export class Simulator {
     if (!isWeekendHour(h)) {
       for (const e of eventsAtH) {
         this.firedEventIds.add(e.id);
-        this.applyEvent(e);
-        this.eventLog.push({
-          hour: h,
-          kind: 'event-fired',
-          detail: e.description,
-          eventId: e.id,
-        });
+        if (e.type === 'opportunity-arrival' && e.opportunityContract) {
+          this.handleOpportunityArrival(e.opportunityContract);
+          this.eventLog.push({
+            hour: h,
+            kind: 'opportunity-arrived',
+            detail: e.description,
+            eventId: e.id,
+            contractId: e.opportunityContract.id,
+          });
+        } else {
+          this.applyEvent(e);
+          this.eventLog.push({
+            hour: h,
+            kind: 'event-fired',
+            detail: e.description,
+            eventId: e.id,
+          });
+        }
         needsReplan = true;
       }
     }
@@ -281,6 +298,10 @@ export class Simulator {
   }
 
   private async replan(): Promise<void> {
+    const subToOriginal: Record<ContractId, ContractId> = {};
+    for (const [subId, ref] of this.subRefs) {
+      subToOriginal[subId] = ref.originalId;
+    }
     const newPlan = await solve({
       chain: this.input.chain,
       contracts: this.expandedContracts,
@@ -290,6 +311,8 @@ export class Simulator {
       delivered: { ...this.subContractDeliveries },
       currentInventory: { ...this.inventory },
       activeDisruptions: this.activeDisruptions.slice(),
+      pendingOpportunityIds: [...this.pendingOpportunityIds],
+      subToOriginal,
     });
     this.plan = newPlan;
     this.indexPlan(newPlan);
@@ -298,6 +321,68 @@ export class Simulator {
       kind: 'replan',
       detail: `Replan produced ${newPlan.shipments.length} new shipments, ${newPlan.deliveries.length} deliveries`,
     });
+    this.processOpportunityDecisions(newPlan);
+  }
+
+  private processOpportunityDecisions(plan: Plan): void {
+    for (const accId of plan.acceptedOpportunityIds ?? []) {
+      if (!this.pendingOpportunityIds.has(accId)) continue;
+      this.pendingOpportunityIds.delete(accId);
+      this.eventLog.push({
+        hour: this.currentHour,
+        kind: 'opportunity-accepted',
+        detail: `Optimizer accepted opportunity ${accId} (revenue exceeds marginal cost)`,
+        contractId: accId,
+      });
+    }
+    for (const decId of plan.declinedOpportunityIds ?? []) {
+      if (!this.pendingOpportunityIds.has(decId)) continue;
+      this.pendingOpportunityIds.delete(decId);
+      this.declinedOpportunityIds.add(decId);
+
+      // Remove the declined opportunity from the working contract list.
+      const cd = this.contractDeliveries[decId];
+      if (cd) cd.status = 'declined';
+      // Zero out sub-contract quantities so future replans see no demand.
+      for (const sub of this.expandedContracts) {
+        const ref = this.subRefs.get(sub.id);
+        if (ref?.originalId === decId) sub.quantity = 0;
+      }
+      this.eventLog.push({
+        hour: this.currentHour,
+        kind: 'opportunity-declined',
+        detail: `Optimizer declined opportunity ${decId} (cost exceeds revenue or capacity bound by committed)`,
+        contractId: decId,
+      });
+    }
+  }
+
+  private handleOpportunityArrival(opportunity: Contract): void {
+    // Append to original list.
+    this.originalContracts = [...this.originalContracts, opportunity];
+
+    const { expanded, subRefs } = expandContractsForOptimizer([opportunity]);
+    for (const sub of expanded) {
+      this.expandedContracts.push(sub);
+      this.subContractDeliveries[sub.id] = 0;
+      const list = this.contractsByEndpoint.get(sub.endpoint) ?? [];
+      list.push(sub);
+      list.sort((a, b) => a.dueByHour - b.dueByHour);
+      this.contractsByEndpoint.set(sub.endpoint, list);
+    }
+    for (const [k, v] of subRefs) this.subRefs.set(k, v);
+
+    this.contractDeliveries[opportunity.id] = {
+      contractId: opportunity.id,
+      delivered: 0,
+      trialDelivered: 0,
+      mainDelivered: 0,
+      status: opportunity.trial ? 'trial-pending' : 'on-track',
+      trialQualityPassed: undefined,
+      trialMinShelfLife: Number.POSITIVE_INFINITY,
+    };
+
+    this.pendingOpportunityIds.add(opportunity.id);
   }
 
   currentState(): SimulationState {
@@ -610,6 +695,9 @@ export class Simulator {
       case 'spoilage-incident':
         // No direct LP effect — quality already tracked per-shipment in slice 5.
         break;
+      case 'opportunity-arrival':
+        // Routed separately in step(); never reaches applyEvent.
+        break;
     }
   }
 
@@ -692,6 +780,7 @@ function deriveStatus(
   cd: ContractDeliveryStatus,
   plan: Plan,
 ): ContractStatus {
+  if (cd.status === 'declined') return 'declined';
   if (!c.trial) {
     if (cd.delivered >= c.quantity - DELIVERY_EPSILON) return 'delivered';
     if (currentHour > c.dueByHour) return 'breached';

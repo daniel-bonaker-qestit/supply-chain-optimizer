@@ -93,4 +93,8 @@ export interface Plan {
   deliveries: DeliveryCommitment[];
   totalCost: number;
   breachByContract: Readonly<Record<ContractId, number>>;
+  /** Original-IDs of opportunities accepted by this LP solve. */
+  acceptedOpportunityIds?: readonly ContractId[];
+  /** Original-IDs of opportunities declined by this LP solve. */
+  declinedOpportunityIds?: readonly ContractId[];
 }

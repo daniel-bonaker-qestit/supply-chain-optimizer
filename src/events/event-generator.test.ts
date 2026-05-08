@@ -9,7 +9,7 @@ import { getSectorDefinition } from '../domain/sector-defs.ts';
 const food = () => getSectorDefinition('food');
 
 describe('event-generator — determinism and counts', () => {
-  it('produces 5 events per active weekday (25 total for a 168h Mon-start run)', () => {
+  it('produces 25 weekday events plus 3–5 opportunity arrivals for a 168h Mon-start run', () => {
     const { chain, horizonHours } = food();
     const events = generateEvents({
       sector: 'food',
@@ -17,7 +17,11 @@ describe('event-generator — determinism and counts', () => {
       chain,
       horizonHours,
     });
-    expect(events.length).toBe(25);
+    const weekday = events.filter((e) => e.type !== 'opportunity-arrival');
+    const opps = events.filter((e) => e.type === 'opportunity-arrival');
+    expect(weekday.length).toBe(25);
+    expect(opps.length).toBeGreaterThanOrEqual(3);
+    expect(opps.length).toBeLessThanOrEqual(5);
   });
 
   it('same (sector, seed) produces identical timelines', () => {
