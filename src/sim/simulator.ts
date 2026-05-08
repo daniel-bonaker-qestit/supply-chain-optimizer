@@ -22,7 +22,7 @@ import type {
 } from '../events/types.ts';
 import type { Hazard } from '../hazards/types.ts';
 import { solve } from '../optimizer/optimizer.ts';
-import { shelfLifeCostOfLeg } from '../quality/food-shelf-life.ts';
+import { getQualityModel } from '../quality/quality-model.ts';
 
 export type SimulationStatus = 'running' | 'complete';
 export type ContractStatus =
@@ -125,6 +125,7 @@ export class Simulator {
   private subRefs: Map<ContractId, SubContractRef>;
   private pendingOpportunityIds: Set<ContractId> = new Set();
   private declinedOpportunityIds: Set<ContractId> = new Set();
+  private qualityModel: ReturnType<typeof getQualityModel>;
 
   private constructor(
     private readonly input: SimulatorInput,
@@ -138,6 +139,7 @@ export class Simulator {
     this.originalContracts = input.contracts;
     this.expandedContracts = expanded.map((c) => ({ ...c }));
     this.subRefs = subRefs;
+    this.qualityModel = getQualityModel(input.chain.sector);
 
     this.contractsByEndpoint = new Map();
     for (const c of this.expandedContracts) {
@@ -471,7 +473,7 @@ export class Simulator {
       const transit = lane.modes[s.mode].transitHours;
       const arrivedShelfLife = Math.max(
         0,
-        (s.shelfLifeAtRelease ?? 0) - shelfLifeCostOfLeg(s.mode, transit),
+        (s.shelfLifeAtRelease ?? 0) - this.qualityModel.decayPerLeg(s.mode, transit),
       );
       const isEndpoint = this.contractsByEndpoint.has(node);
 
@@ -530,7 +532,7 @@ export class Simulator {
       const transit = lane.modes[sc.mode].transitHours;
       let shelfLifeAtRelease: number;
       if (this.input.chain.origins.includes(lane.from)) {
-        shelfLifeAtRelease = INITIAL_SHELF_LIFE;
+        shelfLifeAtRelease = this.qualityModel.initialAtOrigin;
       } else {
         shelfLifeAtRelease = this.popFromNodeQueue(lane.from, sc.quantity);
         this.inventory[lane.from] =
@@ -558,7 +560,7 @@ export class Simulator {
 
   private popFromNodeQueue(node: NodeId, qty: number): number {
     const queue = this.nodeFifoQueues[node];
-    if (!queue) return INITIAL_SHELF_LIFE;
+    if (!queue) return this.qualityModel.initialAtOrigin;
     let remaining = qty;
     let minShelfLife = Number.POSITIVE_INFINITY;
     while (remaining > DELIVERY_EPSILON && queue.length > 0) {
@@ -698,6 +700,35 @@ export class Simulator {
       case 'opportunity-arrival':
         // Routed separately in step(); never reaches applyEvent.
         break;
+      case 'refrigeration-failure':
+        // Pharma: target an in-flight shipment on the affected lane and flip
+        // its integrity to 0. No LP-side disruption.
+        if (e.targetLaneId) {
+          const candidates = this.inFlight.filter(
+            (s) => s.laneId === e.targetLaneId,
+          );
+          if (candidates.length > 0) {
+            // Deterministic pick: oldest in-transit shipment.
+            candidates.sort((a, b) => a.releasedAtHour - b.releasedAtHour);
+            const target = candidates[0]!;
+            target.shelfLifeAtRelease = 0;
+          }
+        }
+        break;
+      case 'regulatory-hold':
+        if (e.targetNodeId) {
+          push({
+            fromHour,
+            toHour,
+            nodeId: e.targetNodeId,
+            effectKind:
+              (e.capacityFactor ?? 0) === 0
+                ? 'block'
+                : 'capacity-factor',
+            capacityFactor: e.capacityFactor,
+          });
+        }
+        break;
     }
   }
 
@@ -771,8 +802,6 @@ export class Simulator {
     }
   }
 }
-
-const INITIAL_SHELF_LIFE = 96;
 
 function deriveStatus(
   c: Contract,

@@ -16,9 +16,11 @@ const SHARED_TYPES: EventType[] = [
 ];
 
 const FOOD_TYPES: EventType[] = ['spoilage-incident', 'contamination-alert'];
+const PHARMA_TYPES: EventType[] = ['refrigeration-failure', 'regulatory-hold'];
 
 const SECTOR_TYPES: Record<Sector, readonly EventType[]> = {
   food: [...SHARED_TYPES, ...FOOD_TYPES],
+  pharma: [...SHARED_TYPES, ...PHARMA_TYPES],
 };
 
 const EVENTS_PER_WEEKDAY = 5;
@@ -95,7 +97,7 @@ function buildOpportunityEvent(
   const id = `evt-${seq.toString().padStart(3, '0')}`;
   const oppId = `opp-${oppIdx.toString().padStart(2, '0')}`;
   const endpoint = chain.nodes[chain.nodes.length - 1]!.id;
-  const horizonHours = 168; // sector-defs uses 168; safe assumption for slice 6
+  const horizonHours = 168;
   const qty = rangeInt(rng, 50, 250);
   const dueByHour = Math.min(
     horizonHours - 8,
@@ -105,6 +107,7 @@ function buildOpportunityEvent(
 
   const trialDueByHour = Math.max(fireHour + 12, dueByHour - 36);
   const trialQuantity = Math.max(1, Math.round(qty * 0.1));
+  const isPharma = sector === 'pharma';
   const opportunityContract = {
     id: oppId,
     endpoint,
@@ -115,8 +118,8 @@ function buildOpportunityEvent(
     trial: {
       quantity: trialQuantity,
       dueByHour: trialDueByHour,
-      initialShelfLife: 96,
-      minShelfLifeAtDelivery: 24,
+      initialShelfLife: isPharma ? 1 : 96,
+      minShelfLifeAtDelivery: isPharma ? 1 : 24,
     },
   };
 
@@ -221,6 +224,33 @@ function buildEvent(
       throw new Error(
         'opportunity-arrival is built via buildOpportunityEvent, not buildEvent',
       );
+    }
+    case 'refrigeration-failure': {
+      // Targets a random lane; sim will pick an in-flight shipment on that
+      // lane at the fire hour and flip its quality to 0.
+      const lane = pick(rng, lanes);
+      return {
+        id,
+        type,
+        fireHour,
+        durationHours: 1,
+        targetLaneId: lane.id,
+        description: `Refrigeration failure on ${lane.id} (in-flight shipment integrity flipped)`,
+        sector,
+      };
+    }
+    case 'regulatory-hold': {
+      const node = pick(rng, nonOrigin.length > 0 ? nonOrigin : chain.nodes);
+      return {
+        id,
+        type,
+        fireHour,
+        durationHours: baseDuration,
+        targetNodeId: node.id,
+        capacityFactor: 0,
+        description: `Regulatory hold at ${node.id} for ${baseDuration}h (outbound halted)`,
+        sector,
+      };
     }
     case 'contamination-alert': {
       // Treats a non-origin, non-endpoint node as quarantined for the duration.
