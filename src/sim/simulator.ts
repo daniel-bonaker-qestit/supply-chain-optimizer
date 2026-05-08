@@ -8,11 +8,16 @@ import type {
 import { solve } from '../optimizer/optimizer.ts';
 
 export type SimulationStatus = 'running' | 'complete';
+export type ContractStatus =
+  | 'on-track'
+  | 'pending'
+  | 'delivered'
+  | 'breached';
 
 export interface ContractDeliveryStatus {
   contractId: ContractId;
   delivered: number;
-  status: 'pending' | 'delivered';
+  status: ContractStatus;
 }
 
 export interface SimulationState {
@@ -39,8 +44,12 @@ export class Simulator {
   private inFlight: Shipment[] = [];
   private contractDeliveries: Record<ContractId, ContractDeliveryStatus>;
   private totalCost: number | undefined = undefined;
-  private plannedByReleaseHour: Map<number, Plan['shipments']>;
+  private plannedByReleaseHour: Map<
+    number,
+    Plan['shipments']
+  >;
   private contractsById: Map<ContractId, Contract>;
+  private contractsByEndpoint: Map<string, Contract[]>;
   private shipmentCounter = 0;
 
   private constructor(
@@ -48,12 +57,32 @@ export class Simulator {
     private readonly plan: Plan,
   ) {
     this.contractsById = new Map(input.contracts.map((c) => [c.id, c]));
+    this.contractsByEndpoint = new Map();
+    for (const c of input.contracts) {
+      const list = this.contractsByEndpoint.get(c.endpoint) ?? [];
+      list.push(c);
+      this.contractsByEndpoint.set(c.endpoint, list);
+    }
+    for (const list of this.contractsByEndpoint.values()) {
+      list.sort((a, b) => a.dueByHour - b.dueByHour);
+    }
+
     this.contractDeliveries = Object.fromEntries(
       input.contracts.map((c) => [
         c.id,
-        { contractId: c.id, delivered: 0, status: 'pending' as const },
+        {
+          contractId: c.id,
+          delivered: 0,
+          status: deriveStatus(
+            c,
+            0,
+            0,
+            plan.breachByContract[c.id] ?? 0,
+          ),
+        },
       ]),
     );
+
     this.plannedByReleaseHour = new Map();
     for (const s of plan.shipments) {
       const list = this.plannedByReleaseHour.get(s.releaseHour) ?? [];
@@ -91,6 +120,8 @@ export class Simulator {
     this.processReleases(h);
 
     this.currentHour = h + 1;
+    this.refreshAllStatuses();
+
     if (this.currentHour >= this.input.horizonHours) {
       this.status = 'complete';
       this.totalCost = this.plan.totalCost;
@@ -111,23 +142,42 @@ export class Simulator {
 
   private processArrivals(h: number): void {
     const remaining: Shipment[] = [];
+    const arrivalsByEndpoint = new Map<string, number>();
+
     for (const s of this.inFlight) {
       if (s.arrivesAtHour !== h) {
         remaining.push(s);
         continue;
       }
-      if (s.contractId !== undefined) {
-        const status = this.contractDeliveries[s.contractId];
-        if (status) {
-          status.delivered += s.quantity;
-          const c = this.contractsById.get(s.contractId);
-          if (c && status.delivered >= c.quantity - DELIVERY_EPSILON) {
-            status.status = 'delivered';
-          }
-        }
+      const lane = this.input.chain.lanes.find((l) => l.id === s.laneId);
+      if (!lane) continue;
+      const endpoint = lane.to;
+      if (this.contractsByEndpoint.has(endpoint)) {
+        arrivalsByEndpoint.set(
+          endpoint,
+          (arrivalsByEndpoint.get(endpoint) ?? 0) + s.quantity,
+        );
       }
     }
     this.inFlight = remaining;
+
+    for (const [endpoint, qty] of arrivalsByEndpoint) {
+      this.allocateArrivalsToContracts(endpoint, qty);
+    }
+  }
+
+  private allocateArrivalsToContracts(endpoint: string, units: number): void {
+    let remaining = units;
+    const contracts = this.contractsByEndpoint.get(endpoint) ?? [];
+    for (const c of contracts) {
+      if (remaining <= DELIVERY_EPSILON) break;
+      const status = this.contractDeliveries[c.id]!;
+      const need = c.quantity - status.delivered;
+      if (need <= DELIVERY_EPSILON) continue;
+      const give = Math.min(need, remaining);
+      status.delivered += give;
+      remaining -= give;
+    }
   }
 
   private processReleases(h: number): void {
@@ -152,4 +202,28 @@ export class Simulator {
       });
     }
   }
+
+  private refreshAllStatuses(): void {
+    for (const c of this.input.contracts) {
+      const cd = this.contractDeliveries[c.id]!;
+      cd.status = deriveStatus(
+        c,
+        this.currentHour,
+        cd.delivered,
+        this.plan.breachByContract[c.id] ?? 0,
+      );
+    }
+  }
+}
+
+function deriveStatus(
+  c: Contract,
+  currentHour: number,
+  delivered: number,
+  plannedBreach: number,
+): ContractStatus {
+  if (delivered >= c.quantity - DELIVERY_EPSILON) return 'delivered';
+  if (currentHour > c.dueByHour) return 'breached';
+  if (plannedBreach > DELIVERY_EPSILON) return 'pending';
+  return 'on-track';
 }

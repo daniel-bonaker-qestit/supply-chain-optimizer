@@ -11,10 +11,19 @@ describe('Simulator — sim-start replan', () => {
     const state = sim.currentState();
 
     expect(state.plan).toBeDefined();
-    expect(state.plan!.shipments.length).toBeGreaterThan(0);
+    expect(state.plan.shipments.length).toBeGreaterThan(0);
     expect(state.currentHour).toBe(0);
     expect(state.status).toBe('running');
     expect(state.totalCost).toBeUndefined();
+  });
+
+  it('initial contract statuses are on-track when the plan has no breach', async () => {
+    const { chain, contracts, horizonHours } = food();
+    const sim = await Simulator.start({ chain, contracts, horizonHours });
+    const state = sim.currentState();
+    for (const c of contracts) {
+      expect(state.contractDeliveries[c.id]!.status).toBe('on-track');
+    }
   });
 });
 
@@ -22,14 +31,12 @@ describe('Simulator — state transitions per step(h)', () => {
   it('rejects step(h) when h !== currentHour', async () => {
     const { chain, contracts, horizonHours } = food();
     const sim = await Simulator.start({ chain, contracts, horizonHours });
-
     expect(() => sim.step(5)).toThrow(/step.*0/);
   });
 
   it('advances currentHour by exactly one per step(h)', async () => {
     const { chain, contracts, horizonHours } = food();
     const sim = await Simulator.start({ chain, contracts, horizonHours });
-
     sim.step(0);
     expect(sim.currentState().currentHour).toBe(1);
     sim.step(1);
@@ -39,7 +46,7 @@ describe('Simulator — state transitions per step(h)', () => {
   it('releases planned shipments at their releaseHour', async () => {
     const { chain, contracts, horizonHours } = food();
     const sim = await Simulator.start({ chain, contracts, horizonHours });
-    const plan = sim.currentState().plan!;
+    const plan = sim.currentState().plan;
     const firstRelease = Math.min(...plan.shipments.map((s) => s.releaseHour));
 
     for (let h = 0; h < firstRelease; h++) sim.step(h);
@@ -52,28 +59,28 @@ describe('Simulator — state transitions per step(h)', () => {
   it('removes shipments from inFlight at their arriveHour', async () => {
     const { chain, contracts, horizonHours } = food();
     const sim = await Simulator.start({ chain, contracts, horizonHours });
-    const plan = sim.currentState().plan!;
+    const plan = sim.currentState().plan;
+    const lastArrival = plan.shipments.reduce((max, s) => {
+      const lane = chain.lanes.find((l) => l.id === s.laneId)!;
+      return Math.max(max, s.releaseHour + lane.modes[s.mode].transitHours);
+    }, 0);
 
-    const lastDelivery = plan.deliveries.reduce(
-      (max, d) => Math.max(max, d.arriveHour),
-      0,
-    );
-
-    for (let h = 0; h <= lastDelivery; h++) sim.step(h);
+    for (let h = 0; h <= lastArrival; h++) sim.step(h);
     expect(sim.currentState().inFlight.length).toBe(0);
   });
 
-  it('records contract delivery when on-time arrivals reach contract.quantity', async () => {
+  it('marks every committed food contract as delivered on time when feasible', async () => {
     const { chain, contracts, horizonHours } = food();
     const sim = await Simulator.start({ chain, contracts, horizonHours });
-    const contract = contracts[0]!;
 
-    for (let h = 0; h < contract.dueByHour; h++) sim.step(h);
+    for (let h = 0; h < horizonHours; h++) sim.step(h);
 
-    const status = sim.currentState().contractDeliveries[contract.id];
-    expect(status).toBeDefined();
-    expect(status!.delivered).toBeGreaterThanOrEqual(contract.quantity - 1e-6);
-    expect(status!.status).toBe('delivered');
+    const state = sim.currentState();
+    for (const c of contracts) {
+      const cd = state.contractDeliveries[c.id]!;
+      expect(cd.delivered).toBeGreaterThanOrEqual(c.quantity - 1e-6);
+      expect(cd.status).toBe('delivered');
+    }
   });
 });
 
@@ -81,7 +88,7 @@ describe('Simulator — terminal state', () => {
   it('reaches status="complete" at currentHour=horizonHours with totalCost=plan.totalCost', async () => {
     const { chain, contracts, horizonHours } = food();
     const sim = await Simulator.start({ chain, contracts, horizonHours });
-    const expectedCost = sim.currentState().plan!.totalCost;
+    const expectedCost = sim.currentState().plan.totalCost;
 
     for (let h = 0; h < horizonHours; h++) sim.step(h);
 
@@ -95,7 +102,6 @@ describe('Simulator — terminal state', () => {
     const { chain, contracts, horizonHours } = food();
     const sim = await Simulator.start({ chain, contracts, horizonHours });
     for (let h = 0; h < horizonHours; h++) sim.step(h);
-
     expect(() => sim.step(horizonHours)).toThrow();
   });
 });

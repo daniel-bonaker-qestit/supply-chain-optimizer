@@ -1,7 +1,11 @@
-import { useRef, useState } from 'react';
+import { useRef, useState, type CSSProperties } from 'react';
 import { getSectorDefinition } from './domain/sector-defs.ts';
-import type { Sector } from './domain/types.ts';
-import { Simulator, type SimulationState } from './sim/simulator.ts';
+import type { Contract, Sector } from './domain/types.ts';
+import {
+  Simulator,
+  type ContractStatus,
+  type SimulationState,
+} from './sim/simulator.ts';
 
 type AppStatus = 'idle' | 'running' | 'complete' | 'error';
 
@@ -119,12 +123,12 @@ export function App() {
           <p>
             <strong>In flight:</strong> {simState.inFlight.length}
           </p>
-          {Object.values(simState.contractDeliveries).map((c) => (
-            <p key={c.contractId}>
-              <strong>Contract {c.contractId}:</strong>{' '}
-              {c.delivered.toFixed(0)} delivered ({c.status})
-            </p>
-          ))}
+          <ContractListPanel
+            simState={simState}
+            contractsById={Object.fromEntries(
+              getSectorDefinition(sector).contracts.map((c) => [c.id, c]),
+            )}
+          />
           {simState.status === 'complete' && (
             <p
               data-testid="run-complete"
@@ -143,8 +147,91 @@ export function App() {
       )}
 
       <footer style={{ marginTop: '2rem', fontSize: '0.85em', color: '#666' }}>
-        Seed (unused in slice 1): <code>{seed}</code>
+        Seed (unused until events / opportunities land): <code>{seed}</code>
       </footer>
     </main>
   );
 }
+
+const STATUS_COLORS: Record<ContractStatus, string> = {
+  'on-track': '#1f6feb',
+  pending: '#9a6700',
+  delivered: '#1a7f37',
+  breached: '#cf222e',
+};
+
+function ContractListPanel({
+  simState,
+  contractsById,
+}: {
+  simState: SimulationState;
+  contractsById: Record<string, Contract>;
+}) {
+  const rows = Object.values(simState.contractDeliveries).map((cd) => {
+    const c = contractsById[cd.contractId];
+    if (!c) return null;
+    const breachQty = simState.plan.breachByContract[cd.contractId] ?? 0;
+    return { contract: c, status: cd, breach: breachQty };
+  });
+
+  return (
+    <div style={{ marginTop: '1rem' }}>
+      <h3 style={{ margin: '0 0 0.5rem 0' }}>Contracts</h3>
+      <table
+        style={{
+          borderCollapse: 'collapse',
+          fontSize: '0.9em',
+          width: '100%',
+          maxWidth: 640,
+        }}
+      >
+        <thead>
+          <tr>
+            <th style={cellHead}>ID</th>
+            <th style={cellHead}>Endpoint</th>
+            <th style={cellHead}>Qty</th>
+            <th style={cellHead}>Due</th>
+            <th style={cellHead}>Delivered</th>
+            <th style={cellHead}>Planned breach</th>
+            <th style={cellHead}>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) =>
+            r === null ? null : (
+              <tr key={r.contract.id}>
+                <td style={cell}>{r.contract.id}</td>
+                <td style={cell}>{r.contract.endpoint}</td>
+                <td style={cell}>{r.contract.quantity}</td>
+                <td style={cell}>h{r.contract.dueByHour}</td>
+                <td style={cell}>{r.status.delivered.toFixed(0)}</td>
+                <td style={cell}>
+                  {r.breach > 1e-6 ? r.breach.toFixed(0) : '—'}
+                </td>
+                <td
+                  style={{
+                    ...cell,
+                    color: STATUS_COLORS[r.status.status],
+                    fontWeight: 600,
+                  }}
+                >
+                  {r.status.status}
+                </td>
+              </tr>
+            ),
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+const cellHead: CSSProperties = {
+  textAlign: 'left',
+  padding: '0.3rem 0.5rem',
+  borderBottom: '2px solid #ddd',
+};
+const cell: CSSProperties = {
+  padding: '0.3rem 0.5rem',
+  borderBottom: '1px solid #eee',
+};

@@ -76,4 +76,5 @@ export interface Plan {
   shipments: ShipmentCommitment[];
   deliveries: DeliveryCommitment[];
   totalCost: number;
+  breachByContract: Readonly<Record<ContractId, number>>;
 }
