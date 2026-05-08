@@ -24,6 +24,10 @@ interface LPContext {
   contractIdxToContractId: ContractId[];
   /** Sim hour at which this LP was built. */
   currentHour: number;
+  /** Map originalId → oppIdx for opportunities with accept binaries. */
+  oppOriginalToIdx: Map<ContractId, number>;
+  /** Pending opportunity originals in their declared order. */
+  pendingOpportunityOriginals: ContractId[];
 }
 
 const xVar = (laneIdx: number, mode: Mode, hour: number): string =>
@@ -31,6 +35,8 @@ const xVar = (laneIdx: number, mode: Mode, hour: number): string =>
 const invVar = (nodeIdx: number, hour: number): string =>
   `inv_n${nodeIdx}_h${hour}`;
 const deliveredVar = (cIdx: number): string => `d_c${cIdx}`;
+const sfVar = (cIdx: number): string => `sf_c${cIdx}`;
+const acceptVar = (oppIdx: number): string => `acc_o${oppIdx}`;
 
 interface DisruptionMatch {
   /** Effective capacity multiplier (1 = unaffected, 0 = blocked). */
@@ -76,6 +82,14 @@ function buildLP(state: OptimizerState): BuiltLP {
   const currentInventory = state.currentInventory ?? {};
   const disruptions: readonly ActiveDisruption[] =
     state.activeDisruptions ?? [];
+  const pendingOriginals = new Set(state.pendingOpportunityIds ?? []);
+  const subToOriginal = state.subToOriginal ?? {};
+  const isPendingForContract = (c: Contract): boolean => {
+    const orig = subToOriginal[c.id] ?? c.id;
+    return pendingOriginals.has(orig);
+  };
+  const originalIdForContract = (c: Contract): ContractId =>
+    subToOriginal[c.id] ?? c.id;
 
   const originSet = new Set(chain.origins);
   const nonOriginNodes = chain.nodes.filter((n) => !originSet.has(n.id));
@@ -92,13 +106,34 @@ function buildLP(state: OptimizerState): BuiltLP {
   });
 
   // Active vs locked contracts.
-  const activeContracts: Array<{ idx: number; c: Contract; remaining: number }> =
-    [];
+  const activeContracts: Array<{
+    idx: number;
+    c: Contract;
+    remaining: number;
+    isPending: boolean;
+    originalId: ContractId;
+  }> = [];
   contracts.forEach((c, idx) => {
     if (c.dueByHour <= currentHour) return; // locked: handled in plan output
     const got = delivered[c.id] ?? 0;
-    activeContracts.push({ idx, c, remaining: Math.max(0, c.quantity - got) });
+    activeContracts.push({
+      idx,
+      c,
+      remaining: Math.max(0, c.quantity - got),
+      isPending: isPendingForContract(c),
+      originalId: originalIdForContract(c),
+    });
   });
+
+  // Pending opportunity originals → oppIdx.
+  const pendingOriginalsList: ContractId[] = [];
+  const oppOriginalToIdx = new Map<ContractId, number>();
+  for (const ac of activeContracts) {
+    if (!ac.isPending) continue;
+    if (oppOriginalToIdx.has(ac.originalId)) continue;
+    oppOriginalToIdx.set(ac.originalId, pendingOriginalsList.length);
+    pendingOriginalsList.push(ac.originalId);
+  }
 
   const activeByEndpoint = new Map<
     string,
@@ -156,10 +191,16 @@ function buildLP(state: OptimizerState): BuiltLP {
     }
   });
 
-  // Maximize delivered: subtract breach * delivered. With sf = remaining - delivered,
-  // breach*sf = breach*remaining - breach*delivered; the constant drops from the objective.
+  // For non-pending active contracts (committed or already-accepted opportunities):
+  // minimize -breach * delivered (with sf = remaining - delivered implicit).
+  // For pending opportunities: minimize -revenue * delivered + breach * sf.
   for (const ac of activeContracts) {
-    objTerms.push(`- ${BREACH_PENALTY_PER_UNIT} ${deliveredVar(ac.idx)}`);
+    if (ac.isPending) {
+      objTerms.push(`- ${ac.c.revenue} ${deliveredVar(ac.idx)}`);
+      objTerms.push(`+ ${BREACH_PENALTY_PER_UNIT} ${sfVar(ac.idx)}`);
+    } else {
+      objTerms.push(`- ${BREACH_PENALTY_PER_UNIT} ${deliveredVar(ac.idx)}`);
+    }
   }
 
   if (objTerms.length === 0) objTerms.push('+ 0 dummy');
@@ -169,8 +210,9 @@ function buildLP(state: OptimizerState): BuiltLP {
   lines.push('Subject To');
 
   // Initial inventory conditions at currentHour for each non-origin node.
+  // Clamp to ≥ 0 to absorb floating-point drift from sim-time accounting.
   nonOriginNodes.forEach((node, nodeIdx) => {
-    const initVal = currentInventory[node.id] ?? 0;
+    const initVal = Math.max(0, currentInventory[node.id] ?? 0);
     lines.push(` init_n${nodeIdx}: ${invVar(nodeIdx, currentHour)} = ${initVal}`);
   });
 
@@ -283,10 +325,38 @@ function buildLP(state: OptimizerState): BuiltLP {
     }
   }
 
+  // Pending-opportunity linking constraints:
+  // delivered_<c> + sf_<c> = c.quantity * accept_<O>  (per sub-contract of a pending opp)
+  for (const ac of activeContracts) {
+    if (!ac.isPending) continue;
+    const oppIdx = oppOriginalToIdx.get(ac.originalId)!;
+    // Linking equality. CPLEX LP: lhs - rhs = 0:
+    // delivered + sf - quantity * accept = 0
+    lines.push(
+      ` opl_${ac.idx}: ${deliveredVar(ac.idx)} + ${sfVar(ac.idx)} - ${ac.c.quantity} ${acceptVar(oppIdx)} = 0`,
+    );
+  }
+
   // ---------- Bounds ----------
   lines.push('Bounds');
   for (const ac of activeContracts) {
-    lines.push(` 0 <= ${deliveredVar(ac.idx)} <= ${ac.remaining}`);
+    if (ac.isPending) {
+      // delivered ≤ c.quantity (linking constraint forces delivered=0 when accept=0)
+      lines.push(` 0 <= ${deliveredVar(ac.idx)} <= ${ac.c.quantity}`);
+      lines.push(` 0 <= ${sfVar(ac.idx)} <= ${ac.c.quantity}`);
+    } else {
+      lines.push(` 0 <= ${deliveredVar(ac.idx)} <= ${ac.remaining}`);
+    }
+  }
+  // Accept binaries:
+  for (let i = 0; i < pendingOriginalsList.length; i++) {
+    lines.push(` 0 <= ${acceptVar(i)} <= 1`);
+  }
+  if (pendingOriginalsList.length > 0) {
+    lines.push('Binary');
+    for (let i = 0; i < pendingOriginalsList.length; i++) {
+      lines.push(` ${acceptVar(i)}`);
+    }
   }
   // Allow inv_<n>_<h> to take any non-negative value (default LB=0).
   // The init constraint pins inv_<n>_<currentHour> exactly. CPLEX needs the
@@ -303,6 +373,8 @@ function buildLP(state: OptimizerState): BuiltLP {
       nodeIdToIdx,
       contractIdxToContractId: contracts.map((c) => c.id),
       currentHour,
+      oppOriginalToIdx,
+      pendingOpportunityOriginals: pendingOriginalsList,
     },
   };
 }
@@ -316,10 +388,12 @@ interface ParsedShipment {
 
 const X_VAR_RE = /^x_l(\d+)_(slow|fast)_h(\d+)$/;
 const D_VAR_RE = /^d_c(\d+)$/;
+const ACC_VAR_RE = /^acc_o(\d+)$/;
 
 interface ParsedSolution {
   shipments: ParsedShipment[];
   deliveredByContractIdx: Map<number, number>;
+  acceptByOppIdx: Map<number, number>;
 }
 
 function parseSolution(
@@ -327,6 +401,7 @@ function parseSolution(
 ): ParsedSolution {
   const shipments: ParsedShipment[] = [];
   const deliveredByContractIdx = new Map<number, number>();
+  const acceptByOppIdx = new Map<number, number>();
 
   for (const [name, col] of Object.entries(columns)) {
     const xm = X_VAR_RE.exec(name);
@@ -347,9 +422,14 @@ function parseSolution(
         Number.parseInt(dm[1]!, 10),
         Math.max(0, col.Primal),
       );
+      continue;
+    }
+    const am = ACC_VAR_RE.exec(name);
+    if (am) {
+      acceptByOppIdx.set(Number.parseInt(am[1]!, 10), col.Primal);
     }
   }
-  return { shipments, deliveredByContractIdx };
+  return { shipments, deliveredByContractIdx, acceptByOppIdx };
 }
 
 function buildPlan(
@@ -454,12 +534,23 @@ function buildPlan(
       a.arriveHour - b.arriveHour || a.contractId.localeCompare(b.contractId),
   );
 
+  // Determine which pending opportunities the LP accepted vs declined.
+  const acceptedOpportunityIds: ContractId[] = [];
+  const declinedOpportunityIds: ContractId[] = [];
+  for (const [origId, oppIdx] of context.oppOriginalToIdx) {
+    const v = parsed.acceptByOppIdx.get(oppIdx) ?? 0;
+    if (v > 0.5) acceptedOpportunityIds.push(origId);
+    else declinedOpportunityIds.push(origId);
+  }
+
   void totalCost;
   return {
     shipments: shipmentCommitments,
     deliveries: deliveryCommitments,
     totalCost: computeTrueCost(state, parsed, breachByContract, context),
     breachByContract,
+    acceptedOpportunityIds,
+    declinedOpportunityIds,
   };
 }
 

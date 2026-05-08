@@ -44,7 +44,9 @@ describe('E2E smoke test', () => {
       seed: 'e2e-events-1',
     });
 
-    expect(sim.currentState().scheduledEvents.length).toBe(25);
+    expect(sim.currentState().scheduledEvents.length).toBeGreaterThanOrEqual(
+      25,
+    );
 
     for (let h = 0; h < horizonHours; h++) await sim.step(h);
 

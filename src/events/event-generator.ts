@@ -69,8 +69,66 @@ export function generateEvents(input: GenerateInput): SimEvent[] {
     }
   }
 
+  // Opportunities are scheduled separately (sub-type, not part of the 5/day pool).
+  const oppRng = rngFromSeed(seed, 'opp:count');
+  const oppCount = 3 + Math.floor(oppRng() * 3); // 3..5 inclusive
+  for (let k = 0; k < oppCount; k++) {
+    const r = rngFromSeed(seed, `opp:${k}`);
+    const day = pick(r, days);
+    const hour = day * HOURS_PER_DAY + rangeInt(r, 8, 20);
+    if (hour >= horizonHours) continue;
+    out.push(buildOpportunityEvent(hour, r, chain, sector, ++seq, k));
+  }
+
   out.sort((a, b) => a.fireHour - b.fireHour || a.id.localeCompare(b.id));
   return out;
+}
+
+function buildOpportunityEvent(
+  fireHour: number,
+  rng: Rng,
+  chain: Chain,
+  sector: Sector,
+  seq: number,
+  oppIdx: number,
+): SimEvent {
+  const id = `evt-${seq.toString().padStart(3, '0')}`;
+  const oppId = `opp-${oppIdx.toString().padStart(2, '0')}`;
+  const endpoint = chain.nodes[chain.nodes.length - 1]!.id;
+  const horizonHours = 168; // sector-defs uses 168; safe assumption for slice 6
+  const qty = rangeInt(rng, 50, 250);
+  const dueByHour = Math.min(
+    horizonHours - 8,
+    fireHour + rangeInt(rng, 36, 96),
+  );
+  const revenue = rangeInt(rng, 9, 18);
+
+  const trialDueByHour = Math.max(fireHour + 12, dueByHour - 36);
+  const trialQuantity = Math.max(1, Math.round(qty * 0.1));
+  const opportunityContract = {
+    id: oppId,
+    endpoint,
+    quantity: qty,
+    dueByHour,
+    revenue,
+    kind: 'opportunity' as const,
+    trial: {
+      quantity: trialQuantity,
+      dueByHour: trialDueByHour,
+      initialShelfLife: 96,
+      minShelfLifeAtDelivery: 24,
+    },
+  };
+
+  return {
+    id,
+    type: 'opportunity-arrival',
+    fireHour,
+    durationHours: 1,
+    description: `Opportunity ${oppId} arrives: ${qty} units to ${endpoint} by h${dueByHour} @ $${revenue}/unit`,
+    sector,
+    opportunityContract,
+  };
 }
 
 function buildEvent(
@@ -158,6 +216,11 @@ function buildEvent(
         description: `Spoilage incident on ${targetLane ?? 'unknown lane'} (logged; quality effect deferred to slice 5)`,
         sector,
       };
+    }
+    case 'opportunity-arrival': {
+      throw new Error(
+        'opportunity-arrival is built via buildOpportunityEvent, not buildEvent',
+      );
     }
     case 'contamination-alert': {
       // Treats a non-origin, non-endpoint node as quarantined for the duration.

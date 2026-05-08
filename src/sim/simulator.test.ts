@@ -163,17 +163,19 @@ describe('Simulator — events + replan triggers', () => {
     });
 
     const initialEvents = sim.currentState().scheduledEvents;
-    expect(initialEvents.length).toBe(25);
+    const weekdayEvents = initialEvents.filter(
+      (e) => e.type !== 'opportunity-arrival',
+    );
+    expect(weekdayEvents.length).toBe(25);
 
     for (let h = 0; h < horizonHours; h++) await sim.step(h);
 
     const log = sim.currentState().eventLog;
     const fired = log.filter((e) => e.kind === 'event-fired');
     const replans = log.filter((e) => e.kind === 'replan');
-    // All scheduled weekday events fire exactly once.
-    expect(fired.length).toBe(initialEvents.length);
-    // At least one replan per distinct event hour. Trial failures (slice 5)
-    // can also trigger additional replans, so use a lower bound.
+    // Non-opportunity events fire exactly once.
+    expect(fired.length).toBe(weekdayEvents.length);
+    // At least one replan per distinct event hour.
     const distinctEventHours = new Set(initialEvents.map((e) => e.fireHour))
       .size;
     expect(replans.length).toBeGreaterThanOrEqual(distinctEventHours);
