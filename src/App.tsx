@@ -208,6 +208,9 @@ const STATUS_COLORS: Record<ContractStatus, string> = {
   pending: '#9a6700',
   delivered: '#1a7f37',
   breached: '#cf222e',
+  'trial-pending': '#8250df',
+  'main-active': '#0969da',
+  voided: '#6e7781',
 };
 
 function ContractListPanel({
@@ -403,6 +406,8 @@ function kindColor(kind: SimulationState['eventLog'][number]['kind']): string {
       return '#9a6700';
     case 'hazard-injected':
       return '#a40e26';
+    case 'trial-evaluated':
+      return '#8250df';
     case 'sim-start':
     case 'sim-complete':
       return '#1a7f37';

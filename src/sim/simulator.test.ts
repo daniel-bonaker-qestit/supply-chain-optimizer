@@ -22,7 +22,7 @@ describe('Simulator — sim-start replan', () => {
     expect(state.totalCost).toBeUndefined();
   });
 
-  it('initial contract statuses are on-track when the plan has no breach', async () => {
+  it('initial contract statuses reflect the trial lifecycle when a trial is configured', async () => {
     const { chain, contracts, horizonHours } = food();
     const sim = await Simulator.start({
       chain,
@@ -32,7 +32,8 @@ describe('Simulator — sim-start replan', () => {
     });
     const state = sim.currentState();
     for (const c of contracts) {
-      expect(state.contractDeliveries[c.id]!.status).toBe('on-track');
+      const expected = c.trial ? 'trial-pending' : 'on-track';
+      expect(state.contractDeliveries[c.id]!.status).toBe(expected);
     }
   });
 });
@@ -171,10 +172,11 @@ describe('Simulator — events + replan triggers', () => {
     const replans = log.filter((e) => e.kind === 'replan');
     // All scheduled weekday events fire exactly once.
     expect(fired.length).toBe(initialEvents.length);
-    // One replan per distinct hour that had ≥ 1 event (collisions in same hour batch).
+    // At least one replan per distinct event hour. Trial failures (slice 5)
+    // can also trigger additional replans, so use a lower bound.
     const distinctEventHours = new Set(initialEvents.map((e) => e.fireHour))
       .size;
-    expect(replans.length).toBe(distinctEventHours);
+    expect(replans.length).toBeGreaterThanOrEqual(distinctEventHours);
   });
 
   it('does not fire events on weekend hours even if they happen to be scheduled there', async () => {
@@ -252,7 +254,15 @@ describe('Simulator — events + replan triggers', () => {
     // disruption profiles some may breach. Both are valid outcomes.
     for (const c of contracts) {
       const cd = state.contractDeliveries[c.id]!;
-      expect(['delivered', 'breached', 'pending']).toContain(cd.status);
+      expect([
+        'delivered',
+        'breached',
+        'pending',
+        'voided',
+        'on-track',
+        'main-active',
+        'trial-pending',
+      ]).toContain(cd.status);
     }
   });
 });
