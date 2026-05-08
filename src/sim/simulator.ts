@@ -21,7 +21,10 @@ import type {
   SimEvent,
 } from '../events/types.ts';
 import type { Hazard } from '../hazards/types.ts';
-import { solve } from '../optimizer/optimizer.ts';
+import {
+  BREACH_PENALTY_PER_UNIT,
+  solve,
+} from '../optimizer/optimizer.ts';
 import { getQualityModel } from '../quality/quality-model.ts';
 
 export type SimulationStatus = 'running' | 'complete';
@@ -88,6 +91,18 @@ export interface SimulatorInput {
   horizonHours: number;
   seed?: string;
   events?: readonly SimEvent[];
+  /** Pre-computed plan to use instead of running the optimizer at sim-start. */
+  initialPlan?: Plan;
+  /** When true, no replan is triggered on events / hazards. */
+  disableReplan?: boolean;
+  /** Pre-applied disruptions (used by perfect-hindsight to bake in the full timeline). */
+  initialDisruptions?: readonly ActiveDisruption[];
+}
+
+export interface RealizedCosts {
+  transport: number;
+  holding: number;
+  breach: number;
 }
 
 const DELIVERY_EPSILON = 1e-6;
@@ -126,6 +141,9 @@ export class Simulator {
   private pendingOpportunityIds: Set<ContractId> = new Set();
   private declinedOpportunityIds: Set<ContractId> = new Set();
   private qualityModel: ReturnType<typeof getQualityModel>;
+  private realizedTransport = 0;
+  private realizedHolding = 0;
+  private realizedBreach = 0;
 
   private constructor(
     private readonly input: SimulatorInput,
@@ -181,6 +199,11 @@ export class Simulator {
         },
       ]),
     );
+
+    if (input.initialDisruptions) {
+      this.activeDisruptions.push(...input.initialDisruptions);
+    }
+
     this.refreshAllStatuses(); // adjust for initial plan breach forecasts.
 
     this.plannedByReleaseHour = new Map();
@@ -208,16 +231,18 @@ export class Simulator {
       input.contracts,
     );
 
-    const plan = await solve({
-      chain: input.chain,
-      contracts: expanded,
-      currentHour: 0,
-      horizonHours: input.horizonHours,
-      inFlight: [],
-      delivered: {},
-      currentInventory: {},
-      activeDisruptions: [],
-    });
+    const plan =
+      input.initialPlan ??
+      (await solve({
+        chain: input.chain,
+        contracts: expanded,
+        currentHour: 0,
+        horizonHours: input.horizonHours,
+        inFlight: [],
+        delivered: {},
+        currentInventory: {},
+        activeDisruptions: input.initialDisruptions ?? [],
+      }));
     return new Simulator(input, plan, events, expanded, subRefs);
   }
 
@@ -273,7 +298,11 @@ export class Simulator {
     const trialReplanNeeded = this.evaluateTrialDeadlines();
     if (trialReplanNeeded) needsReplan = true;
 
-    if (needsReplan && this.currentHour < this.input.horizonHours) {
+    if (
+      needsReplan &&
+      !this.input.disableReplan &&
+      this.currentHour < this.input.horizonHours
+    ) {
       if (this.isReplanSuppressed(this.currentHour)) {
         this.eventLog.push({
           hour: this.currentHour,
@@ -286,15 +315,19 @@ export class Simulator {
       }
     }
 
+    this.accumulateHoldingCost();
+
     this.refreshAllStatuses();
 
     if (this.currentHour >= this.input.horizonHours) {
       this.status = 'complete';
-      this.totalCost = this.plan.totalCost;
+      this.realizedBreach = this.computeRealizedBreach();
+      this.totalCost =
+        this.realizedTransport + this.realizedHolding + this.realizedBreach;
       this.eventLog.push({
         hour: this.currentHour,
         kind: 'sim-complete',
-        detail: `Run complete; total cost ${this.totalCost.toFixed(2)}`,
+        detail: `Run complete; realized cost ${this.totalCost.toFixed(2)} (transport=${this.realizedTransport.toFixed(0)}, holding=${this.realizedHolding.toFixed(0)}, breach=${this.realizedBreach.toFixed(0)})`,
       });
     }
   }
@@ -402,6 +435,15 @@ export class Simulator {
       inventory: { ...this.inventory },
       injectedHazards: this.injectedHazards.slice(),
       replanSuppressedUntilHour: this.replanSuppressedUntilHour,
+    };
+  }
+
+  /** Realized cost breakdown — meaningful after sim completion. */
+  realizedCosts(): RealizedCosts {
+    return {
+      transport: this.realizedTransport,
+      holding: this.realizedHolding,
+      breach: this.realizedBreach,
     };
   }
 
@@ -549,7 +591,56 @@ export class Simulator {
         contractId: sc.contractId,
         shelfLifeAtRelease,
       });
+
+      // Realized transport cost: effective unit cost at release time.
+      const effCost = this.effectivePriceMultiplier(sc.laneId, sc.mode, h);
+      this.realizedTransport +=
+        sc.quantity * lane.modes[sc.mode].costPerUnit * effCost;
     }
+  }
+
+  private accumulateHoldingCost(): void {
+    for (const n of this.input.chain.nodes) {
+      if (this.input.chain.origins.includes(n.id)) continue;
+      if (n.holdingCostPerUnitHour <= 0) continue;
+      const inv = this.inventory[n.id] ?? 0;
+      if (inv > 0) {
+        this.realizedHolding += inv * n.holdingCostPerUnitHour;
+      }
+    }
+  }
+
+  private computeRealizedBreach(): number {
+    let total = 0;
+    for (const c of this.originalContracts) {
+      if (this.declinedOpportunityIds.has(c.id)) continue;
+      const cd = this.contractDeliveries[c.id];
+      if (!cd) continue;
+      if (cd.status === 'voided' || cd.status === 'declined') continue;
+      const shortfall = Math.max(0, c.quantity - cd.delivered);
+      if (shortfall > 0) total += shortfall * BREACH_PENALTY_PER_UNIT;
+    }
+    return total;
+  }
+
+  private effectivePriceMultiplier(
+    laneId: string,
+    mode: Mode,
+    hour: number,
+  ): number {
+    const lane = this.input.chain.lanes.find((l) => l.id === laneId);
+    if (!lane) return 1;
+    let mul = 1;
+    for (const d of this.activeDisruptions) {
+      if (hour < d.fromHour || hour >= d.toHour) continue;
+      if (d.laneId !== undefined && d.laneId !== laneId) continue;
+      if (d.mode !== undefined && d.mode !== mode) continue;
+      if (d.nodeId !== undefined && d.nodeId !== lane.from) continue;
+      if (d.effectKind === 'price-multiplier') {
+        mul *= d.priceMultiplier ?? 1;
+      }
+    }
+    return mul;
   }
 
   private enqueueAtNode(node: NodeId, qty: number, shelfLife: number): void {
